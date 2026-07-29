@@ -1,0 +1,76 @@
+{
+  "index_patterns": [
+    "incidentops-logs-*"
+  ],
+  "priority": 500,
+  "version": 1,
+  "_meta": {
+    "description": "IncidentOps application JSONL log mapping",
+    "managed_by": "scripts/initialize-elasticsearch.sh"
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "level": {
+          "type": "keyword"
+        },
+        "service": {
+          "type": "keyword"
+        },
+        "event_type": {
+          "type": "keyword"
+        },
+        "logger": {
+          "type": "keyword"
+        },
+        "message": {
+          "type": "text"
+        },
+        "event_id": {
+          "type": "keyword"
+        },
+        "order_id": {
+          "type": "keyword"
+        },
+        "duration_ms": {
+          "type": "float"
+        },
+        "error_type": {
+          "type": "keyword"
+        },
+        "run_id": {
+          "type": "keyword"
+        },
+        "exception": {
+          "type": "text"
+        },
+        "topic": {
+          "type": "keyword"
+        },
+        "consumer_group": {
+          "type": "keyword"
+        },
+        "count": {
+          "type": "long"
+        },
+        "failed": {
+          "type": "long"
+        },
+        "inserted": {
+          "type": "boolean"
+        },
+        "inserted_count": {
+          "type": "long"
+        }
+      }
+    }
+  }
+}

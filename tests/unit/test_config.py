@@ -29,8 +29,16 @@ def test_environment_overrides_configuration(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("KAFKA_TOPIC", "orders.test")
     monkeypatch.setenv("ORDER_RANDOM_SEED", "99")
+    monkeypatch.setenv("THIRD_PARTY_LOG_LEVEL", "ERROR")
+    monkeypatch.setenv("LOG_FILE_ENABLED", "false")
+    monkeypatch.setenv("LOG_DIRECTORY", "temporary-logs")
+    monkeypatch.setenv("RUN_ID", "config-test")
 
     settings = Settings()
 
     assert settings.kafka_topic == "orders.test"
     assert settings.order_random_seed == 99
+    assert settings.third_party_log_level == "ERROR"
+    assert settings.log_file_enabled is False
+    assert settings.log_directory == Path("temporary-logs")
+    assert settings.run_id == "config-test"

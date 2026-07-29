@@ -16,7 +16,7 @@ from confluent_kafka.cimpl import NewTopic
 from pydantic import ValidationError
 
 from incidentops.config import Settings, get_settings
-from incidentops.logging import configure_logging
+from incidentops.logging import configure_logging, get_third_party_logger
 from incidentops.models import generate_order_event
 
 SERVICE_NAME = "order-producer"
@@ -63,10 +63,11 @@ def ensure_topic(
     bootstrap_servers: str,
     topic: str,
     logger: logging.Logger,
+    third_party_logger: logging.Logger,
 ) -> None:
     """Create the local single-partition topic when it does not exist."""
 
-    admin = AdminClient({"bootstrap.servers": bootstrap_servers}, logger=logger)
+    admin = AdminClient({"bootstrap.servers": bootstrap_servers}, logger=third_party_logger)
     futures = admin.create_topics(
         [NewTopic(topic, num_partitions=1, replication_factor=1)],
         operation_timeout=10,
@@ -99,7 +100,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     parser.add_argument("--count", type=non_negative_integer, default=1)
     parser.add_argument("--rate", type=positive_float, default=1.0)
     parser.add_argument("--seed", type=int, default=settings.order_random_seed)
-    parser.add_argument("--run-id", type=valid_run_id, default="producer")
+    parser.add_argument("--run-id", type=valid_run_id, default=settings.run_id)
     parser.add_argument("--schema-version", default="1.0")
     parser.add_argument("--bootstrap-servers", default=settings.kafka_bootstrap_servers)
     parser.add_argument("--topic", default=settings.kafka_topic)
@@ -107,10 +108,18 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     return parser
 
 
-def run(arguments: argparse.Namespace) -> int:
+def run(arguments: argparse.Namespace, settings: Settings) -> int:
     """Produce the requested batch and return a process exit code."""
 
-    logger = configure_logging(SERVICE_NAME, arguments.log_level)
+    logger = configure_logging(
+        SERVICE_NAME,
+        arguments.log_level,
+        third_party_level=settings.third_party_log_level,
+        file_enabled=settings.log_file_enabled,
+        log_directory=settings.log_directory,
+        run_id=arguments.run_id,
+    )
+    third_party_logger = get_third_party_logger(SERVICE_NAME)
     shutdown_requested = Event()
     summary = DeliverySummary()
     started_at = time.monotonic()
@@ -126,7 +135,12 @@ def run(arguments: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, request_shutdown)
 
     try:
-        ensure_topic(arguments.bootstrap_servers, arguments.topic, logger)
+        ensure_topic(
+            arguments.bootstrap_servers,
+            arguments.topic,
+            logger,
+            third_party_logger,
+        )
     except KafkaException as error:
         logger.error(
             "Could not create or inspect the Kafka topic",
@@ -146,7 +160,7 @@ def run(arguments: argparse.Namespace) -> int:
             "acks": "all",
             "message.timeout.ms": 15_000,
         },
-        logger=logger,
+        logger=third_party_logger,
     )
 
     def delivery_report(error: KafkaError | None, message: Message) -> None:
@@ -240,7 +254,7 @@ def main() -> None:
 
     settings = get_settings()
     arguments = build_parser(settings).parse_args()
-    sys.exit(run(arguments))
+    sys.exit(run(arguments, settings))
 
 
 if __name__ == "__main__":

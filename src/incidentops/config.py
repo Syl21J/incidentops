@@ -1,6 +1,7 @@
 """Application configuration loaded from environment variables."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator
@@ -28,6 +29,12 @@ class Settings(BaseSettings):
     postgres_db: str = "incidentops"
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    third_party_log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
+    log_file_enabled: bool = True
+    log_directory: Path = Path("logs")
+    run_id: str = "local"
+
+    elasticsearch_url: str = "http://localhost:9200"
     order_random_seed: int = 42
 
     @field_validator(
@@ -37,6 +44,8 @@ class Settings(BaseSettings):
         "postgres_host",
         "postgres_user",
         "postgres_db",
+        "run_id",
+        "elasticsearch_url",
     )
     @classmethod
     def reject_blank_values(cls, value: str) -> str:

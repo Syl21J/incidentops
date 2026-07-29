@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from incidentops.config import Settings, get_settings
 from incidentops.database import connect_database, insert_order
-from incidentops.logging import configure_logging
+from incidentops.logging import configure_logging, get_third_party_logger
 from incidentops.models import OrderEvent
 
 SERVICE_NAME = "order-consumer"
@@ -47,6 +47,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     parser.add_argument("--group", default=settings.kafka_consumer_group)
     parser.add_argument("--max-messages", type=positive_integer)
     parser.add_argument("--idle-timeout", type=positive_float)
+    parser.add_argument("--run-id", default=settings.run_id)
     parser.add_argument("--log-level", default=settings.log_level)
     return parser
 
@@ -60,7 +61,15 @@ def commit_message(consumer: Consumer, message: Message) -> None:
 def run(arguments: argparse.Namespace, settings: Settings) -> int:
     """Consume messages until a signal or optional message limit is reached."""
 
-    logger = configure_logging(SERVICE_NAME, arguments.log_level)
+    logger = configure_logging(
+        SERVICE_NAME,
+        arguments.log_level,
+        third_party_level=settings.third_party_log_level,
+        file_enabled=settings.log_file_enabled,
+        log_directory=settings.log_directory,
+        run_id=arguments.run_id,
+    )
+    third_party_logger = get_third_party_logger(SERVICE_NAME)
     shutdown_requested = False
     handled_count = 0
     inserted_count = 0
@@ -100,7 +109,7 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             "auto.offset.reset": "earliest",
             "enable.partition.eof": True,
         },
-        logger=logger,
+        logger=third_party_logger,
     )
 
     try:
@@ -237,7 +246,7 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             "topic": arguments.topic,
             "consumer_group": arguments.group,
             "count": handled_count,
-            "inserted": inserted_count,
+            "inserted_count": inserted_count,
             "failed": invalid_count,
             "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
         },

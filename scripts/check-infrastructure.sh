@@ -105,7 +105,7 @@ wait_for_healthy() {
   return 1
 }
 
-for service in postgres elasticsearch kafka; do
+for service in postgres elasticsearch kafka filebeat; do
   wait_for_healthy "${service}"
 done
 

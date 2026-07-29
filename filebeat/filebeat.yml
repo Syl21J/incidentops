@@ -1,0 +1,35 @@
+filebeat.inputs:
+  - type: filestream
+    id: incidentops-application-jsonl
+    enabled: true
+    paths:
+      - /var/log/incidentops/**/*.jsonl
+    encoding: utf-8
+    prospector.scanner.check_interval: 1s
+    # Content fingerprints are stable across WSL/Docker filesystem boundaries.
+    # One hundred twenty-eight bytes include service context without delaying
+    # ingestion because every application JSON line is longer than this.
+    prospector.scanner.fingerprint:
+      enabled: true
+      offset: 0
+      length: 128
+    file_identity.fingerprint: ~
+    parsers:
+      - ndjson:
+          target: ""
+          overwrite_keys: true
+          add_error_key: true
+          message_key: message
+
+# The repository-owned template is installed by initialize-elasticsearch.sh.
+setup.template.enabled: false
+setup.ilm.enabled: false
+
+output.elasticsearch:
+  hosts:
+    - http://elasticsearch:9200
+  index: "incidentops-logs-%{+yyyy.MM.dd}"
+
+# Keep Filebeat diagnostics on container stdout/stderr only.
+logging.level: info
+logging.to_files: false

@@ -1,4 +1,5 @@
 services:
+  # PostgreSQL stores the idempotently processed order events.
   postgres:
     image: postgres:17.10-alpine3.23
     environment:
@@ -6,8 +7,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local-only}
       POSTGRES_DB: ${POSTGRES_DB:-incidentops}
     ports:
+      # Bind only to WSL localhost; containers use postgres:5432.
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
+      # PostgreSQL 17 and earlier persist data at this image-defined path.
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test:
@@ -23,6 +26,8 @@ services:
     networks:
       - incidentops
 
+  # Elasticsearch stores searchable application logs and remains security-free
+  # only for this isolated local development environment.
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.19.17
     environment:
@@ -30,6 +35,7 @@ services:
       xpack.security.enabled: "false"
       ES_JAVA_OPTS: ${ELASTICSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
     ports:
+      # Python search tools in WSL connect through this loopback binding.
       - "127.0.0.1:${ELASTICSEARCH_PORT:-9200}:9200"
     volumes:
       - elasticsearch_data:/usr/share/elasticsearch/data
@@ -47,6 +53,7 @@ services:
     networks:
       - incidentops
 
+  # Kafka runs a single combined KRaft broker/controller for local development.
   kafka:
     image: apache/kafka:4.3.1
     environment:
@@ -56,7 +63,8 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
-      # Containers use kafka:29092; programs in WSL use localhost:9092.
+      # Containers use INTERNAL://kafka:29092; WSL programs use
+      # EXTERNAL://localhost:9092. CONTROLLER is reserved for KRaft quorum traffic.
       KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT:-9092}
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
@@ -83,11 +91,42 @@ services:
     networks:
       - incidentops
 
+  # Filebeat tails application-owned JSONL files without coupling the Python
+  # processes to Elasticsearch.
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.19.17
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    volumes:
+      # The configuration and application logs are immutable inside the container.
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ./logs:/var/log/incidentops:ro
+      # A persistent registry prevents replaying every file after a restart.
+      - filebeat_data:/usr/share/filebeat/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "filebeat test output -c /usr/share/filebeat/filebeat.yml >/dev/null 2>&1",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - incidentops
+
 networks:
+  # One private bridge provides stable service names for container-to-container traffic.
   incidentops:
     driver: bridge
 
 volumes:
+  # Named volumes are intentionally retained by normal `docker compose down`.
   postgres_data:
   elasticsearch_data:
   kafka_data:
+  filebeat_data:

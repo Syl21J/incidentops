@@ -102,7 +102,7 @@ log "Applying the idempotent database migration"
 
 # A zero-event producer call creates the isolated topic through application code.
 log "Creating isolated Kafka topic ${TEST_TOPIC}"
-uv run python -m incidentops.producer \
+LOG_FILE_ENABLED=false uv run python -m incidentops.producer \
   --count 0 \
   --rate 1 \
   --seed 20260729 \
@@ -112,9 +112,10 @@ topic_created=true
 
 # Start a bounded consumer and keep its JSON output for failure diagnostics.
 log "Starting temporary consumer; log: ${CONSUMER_LOG}"
-uv run python -m incidentops.consumer \
+LOG_FILE_ENABLED=false uv run python -m incidentops.consumer \
   --topic "${TEST_TOPIC}" \
   --group "${TEST_GROUP}" \
+  --run-id "${RUN_ID}" \
   --max-messages "${PRODUCED_MESSAGES}" \
   --idle-timeout 60 \
   >"${CONSUMER_LOG}" 2>&1 &
@@ -141,7 +142,7 @@ success "Temporary consumer received its partition assignment"
 # Send the same deterministic batch twice to exercise database idempotency.
 for batch in 1 2; do
   log "Producing deterministic batch ${batch}/2"
-  uv run python -m incidentops.producer \
+  LOG_FILE_ENABLED=false uv run python -m incidentops.producer \
     --count "${EXPECTED_ROWS}" \
     --rate 100 \
     --seed 20260729 \
