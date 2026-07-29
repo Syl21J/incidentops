@@ -26,6 +26,25 @@ tails those files, remembers offsets in a persistent registry, and sends parsed 
 Elasticsearch. The applications have no Elasticsearch dependency and continue to process
 orders when Filebeat or Elasticsearch is unavailable.
 
+## Project status
+
+IncidentOps is an educational local-development project. The first three implementation
+stages are complete:
+
+- PostgreSQL, Kafka, Elasticsearch, and Filebeat run as healthy Docker Compose services.
+- The Python producer and consumer run directly in WSL and implement an idempotent
+  Kafka-to-PostgreSQL order pipeline.
+- Application logs are validated JSON, written to stdout and optional JSONL files, shipped by
+  Filebeat, and searchable through bounded typed Python tools.
+- Unit tests cover configuration, logging, query construction, response validation, and
+  processing behavior. Local integration and end-to-end scripts cover the real services.
+- GitHub Actions runs formatting, linting, type checking, and tests for every push to `main`
+  and every pull request.
+
+This is not a production deployment. Authentication, TLS, external secret management,
+retention policies, high availability, and production operations are intentionally outside
+the current local MVP.
+
 ## Prerequisites
 
 - Docker Compose v2
@@ -202,6 +221,75 @@ The Python API in `incidentops.log_search` exposes the typed functions `search_l
 `count_logs_by_event_type`, and `get_log_timeline`. Pydantic validates query parameters and
 Elasticsearch responses.
 
+### Real Elasticsearch search example
+
+The following result was returned by the local Elasticsearch instance after producing the
+deterministic run `demo-elasticsearch-1`:
+
+```bash
+uv run python -m incidentops.log_search search \
+  --run-id demo-elasticsearch-1 \
+  --service order-producer \
+  --event-type production_summary \
+  --minutes 10080 \
+  --limit 1
+```
+
+```json
+{
+  "total": 1,
+  "logs": [
+    {
+      "@timestamp": "2026-07-29T13:20:49.117000Z",
+      "level": "INFO",
+      "service": "order-producer",
+      "event_type": "production_summary",
+      "message": "Order production completed",
+      "logger": "order-producer",
+      "event_id": null,
+      "order_id": null,
+      "duration_ms": 1858.55,
+      "error_type": null,
+      "run_id": "demo-elasticsearch-1"
+    }
+  ]
+}
+```
+
+The exact `run_id`, `service`, and `event_type` filters select the final producer summary.
+`duration_ms` shows that producing and acknowledging the ten-event batch took about 1.86
+seconds.
+
+### Real Elasticsearch aggregation example
+
+```bash
+uv run python -m incidentops.log_search aggregate \
+  --group-by event_type \
+  --run-id demo-elasticsearch-1 \
+  --minutes 10080
+```
+
+```json
+{
+  "group_by": "event_type",
+  "buckets": [
+    {"key": "order_processed", "count": 10},
+    {"key": "consumer_error", "count": 2},
+    {"key": "consumer_started", "count": 2},
+    {"key": "consumer_summary", "count": 2},
+    {"key": "shutdown_requested", "count": 2},
+    {"key": "partitions_assigned", "count": 1},
+    {"key": "production_summary", "count": 1},
+    {"key": "topic_created", "count": 1}
+  ]
+}
+```
+
+The ten `order_processed` documents correspond to the ten generated orders. The startup,
+topic, partition, shutdown, and summary buckets describe the surrounding application
+lifecycle. The two early `consumer_error` documents record attempts made before the Kafka
+topic existed; they remain searchable operational evidence rather than being hidden.
+
 ## End-to-end log validation
 
 Run the complete collection and search check:
@@ -256,6 +344,29 @@ uv run ruff check .
 uv run pyright
 uv run pytest
 ```
+
+The workflow in `.github/workflows/ci.yml` executes these checks with Python 3.12 and the
+locked dependencies on every push to `main` and every pull request. Elasticsearch-dependent
+integration coverage skips when Elasticsearch is unavailable in the CI runner. Run
+`./scripts/check-pipeline.sh` and `./scripts/check-log-pipeline.sh` locally for real
+Kafka/PostgreSQL and log-pipeline validation.
+
+## Next steps
+
+The current milestone stops after centralized log collection and search. Potential future
+stages, each requiring an explicit implementation request, are:
+
+1. Add Prometheus metrics and Grafana dashboards without replacing the Elasticsearch log
+   path.
+2. Define controlled incident scenarios and service-level indicators.
+3. Add runbook retrieval and agent workflows only after the observability foundations are
+   validated.
+4. Evaluate OpenTelemetry, MCP, Kubernetes, and application containerization separately
+   rather than expanding the local MVP implicitly.
+
+## License
+
+IncidentOps is available under the [MIT License](LICENSE).
 
 ## Troubleshooting
 
