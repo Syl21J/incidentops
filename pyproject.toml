@@ -7,15 +7,18 @@ requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.12,<3",
     "elasticsearch>=8.19,<9",
+    "prometheus-client==0.25.0",
     "psycopg[binary]>=3.2,<4",
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.11,<3",
+    "pyyaml>=6.0,<7",
 ]
 
 [project.scripts]
 incidentops-producer = "incidentops.producer:main"
 incidentops-consumer = "incidentops.consumer:main"
 incidentops-log-search = "incidentops.log_search:main"
+incidentops-metric-query = "incidentops.metric_query:main"
 
 [dependency-groups]
 dev = [

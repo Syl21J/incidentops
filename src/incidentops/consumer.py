@@ -1,6 +1,7 @@
 """Command-line Kafka consumer persisting validated orders in PostgreSQL."""
 
 import argparse
+import logging
 import signal
 import sys
 import time
@@ -13,6 +14,7 @@ from pydantic import ValidationError
 from incidentops.config import Settings, get_settings
 from incidentops.database import connect_database, insert_order
 from incidentops.logging import configure_logging, get_third_party_logger
+from incidentops.metrics import ConsumerMetrics, MetricsServer, create_consumer_metrics
 from incidentops.models import OrderEvent
 
 SERVICE_NAME = "order-consumer"
@@ -36,6 +38,88 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def tcp_port(value: str) -> int:
+    """Parse a valid TCP port."""
+
+    parsed = int(value)
+    if not 1 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("value must be between 1 and 65535")
+    return parsed
+
+
+def processing_delay_ms(value: str) -> int:
+    """Parse the bounded development-only processing delay."""
+
+    parsed = int(value)
+    if not 0 <= parsed <= 5_000:
+        raise argparse.ArgumentTypeError("processing delay must be between 0 and 5000 ms")
+    return parsed
+
+
+def slow_threshold_ms(value: str) -> int:
+    """Parse the bounded slow-processing logging threshold."""
+
+    parsed = int(value)
+    if not 0 <= parsed <= 60_000:
+        raise argparse.ArgumentTypeError("slow threshold must be between 0 and 60000 ms")
+    return parsed
+
+
+def calculate_partition_lag(low_offset: int, high_offset: int, committed_offset: int) -> int:
+    """Return retained messages after the committed next offset, never below zero.
+
+    Kafka reports an invalid negative offset when a group has not committed. In that
+    case the retained low watermark is the safe effective starting offset.
+    """
+
+    effective_committed = low_offset if committed_offset < low_offset else committed_offset
+    return max(0, high_offset - effective_committed)
+
+
+def collect_total_consumer_lag(
+    consumer: Consumer,
+    partitions: list[TopicPartition],
+    *,
+    timeout: float = 1.0,
+) -> int:
+    """Sum authoritative Kafka high-watermark minus committed offsets."""
+
+    if not partitions:
+        return 0
+    requested = [TopicPartition(item.topic, item.partition) for item in partitions]
+    committed = consumer.committed(requested, timeout=timeout)
+    total = 0
+    for partition in committed:
+        low, high = consumer.get_watermark_offsets(
+            TopicPartition(partition.topic, partition.partition),
+            timeout=timeout,
+            cached=False,
+        )
+        total += calculate_partition_lag(low, high, partition.offset)
+    return total
+
+
+def log_slow_processing(
+    logger: logging.Logger,
+    event: OrderEvent,
+    duration_ms: float,
+    threshold_ms: int,
+) -> None:
+    """Emit scenario evidence only when the complete processing path is slow."""
+
+    if duration_ms < threshold_ms:
+        return
+    logger.warning(
+        "Order processing exceeded the configured slow threshold",
+        extra={
+            "event_type": "slow_processing",
+            "event_id": str(event.event_id),
+            "order_id": str(event.order_id),
+            "duration_ms": round(duration_ms, 2),
+        },
+    )
+
+
 def build_parser(settings: Settings) -> argparse.ArgumentParser:
     """Build the consumer command-line parser."""
 
@@ -49,6 +133,31 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     parser.add_argument("--idle-timeout", type=positive_float)
     parser.add_argument("--run-id", default=settings.run_id)
     parser.add_argument("--log-level", default=settings.log_level)
+    parser.add_argument(
+        "--processing-delay-ms",
+        type=processing_delay_ms,
+        default=settings.consumer_processing_delay_ms,
+        help="Development/test-only artificial delay inside each message processing path.",
+    )
+    parser.add_argument(
+        "--slow-processing-threshold-ms",
+        type=slow_threshold_ms,
+        default=settings.slow_processing_threshold_ms,
+    )
+    parser.add_argument(
+        "--lag-update-interval-seconds",
+        type=positive_float,
+        default=settings.consumer_lag_update_interval_seconds,
+    )
+    parser.add_argument("--metrics-host", default=settings.metrics_host)
+    parser.add_argument("--metrics-port", type=tcp_port, default=settings.consumer_metrics_port)
+    parser.add_argument(
+        "--no-metrics",
+        action="store_false",
+        dest="metrics_enabled",
+        default=settings.metrics_enabled,
+        help="Disable the Prometheus endpoint (primarily for isolated tests).",
+    )
     return parser
 
 
@@ -76,6 +185,28 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
     invalid_count = 0
     started_at = time.monotonic()
     last_message_at = started_at
+    assigned_partitions: list[TopicPartition] = []
+    next_lag_update_at = started_at
+    metrics: ConsumerMetrics = create_consumer_metrics()
+    metrics.kafka_consumer_lag.set(0)
+    metrics_server: MetricsServer | None = None
+
+    if arguments.metrics_enabled:
+        try:
+            metrics_server = MetricsServer.start(
+                host=arguments.metrics_host,
+                port=arguments.metrics_port,
+                registry=metrics.registry,
+            )
+        except OSError as error:
+            logger.error(
+                "Could not start the Prometheus metrics endpoint",
+                extra={
+                    "event_type": "metrics_start_failed",
+                    "error_type": type(error).__name__,
+                },
+            )
+            return 1
 
     def request_shutdown(signum: int, _frame: FrameType | None) -> None:
         nonlocal shutdown_requested
@@ -86,7 +217,10 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
         )
 
     def on_assign(consumer: Consumer, partitions: list[TopicPartition]) -> None:
+        nonlocal assigned_partitions, next_lag_update_at
         consumer.assign(partitions)
+        assigned_partitions = list(partitions)
+        next_lag_update_at = 0.0
         logger.info(
             "Kafka partitions assigned",
             extra={
@@ -115,6 +249,7 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
     try:
         connection = connect_database(settings)
     except psycopg.Error as error:
+        metrics.processing_errors.inc()
         logger.error(
             "Could not connect to PostgreSQL",
             extra={
@@ -123,6 +258,8 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             },
         )
         consumer.close()
+        if metrics_server is not None:
+            metrics_server.close()
         return 1
 
     consumer.subscribe([arguments.topic], on_assign=on_assign)
@@ -140,6 +277,24 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
         while not shutdown_requested:
             if arguments.max_messages is not None and handled_count >= arguments.max_messages:
                 break
+
+            now = time.monotonic()
+            if assigned_partitions and now >= next_lag_update_at:
+                try:
+                    metrics.kafka_consumer_lag.set(
+                        collect_total_consumer_lag(consumer, assigned_partitions)
+                    )
+                except (KafkaException, RuntimeError) as error:
+                    logger.warning(
+                        "Kafka consumer lag collection failed",
+                        extra={
+                            "event_type": "lag_collection_failed",
+                            "error_type": type(error).__name__,
+                            "topic": arguments.topic,
+                            "consumer_group": arguments.group,
+                        },
+                    )
+                next_lag_update_at = now + arguments.lag_update_interval_seconds
 
             message = consumer.poll(1.0)
             if message is None:
@@ -163,6 +318,7 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             if message_error is not None:
                 if message_error.code() == KafkaError._PARTITION_EOF:
                     continue
+                metrics.processing_errors.inc()
                 logger.error(
                     "Kafka consumer returned an error",
                     extra={
@@ -174,6 +330,10 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
                 continue
 
             last_message_at = time.monotonic()
+            event_started_at = time.monotonic()
+            metrics.orders_consumed.inc()
+            if arguments.processing_delay_ms:
+                time.sleep(arguments.processing_delay_ms / 1000)
             try:
                 payload = message.value()
                 if payload is None:
@@ -182,6 +342,8 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             except (ValidationError, UnicodeDecodeError, ValueError) as error:
                 invalid_count += 1
                 handled_count += 1
+                metrics.processing_errors.inc()
+                metrics.processing_duration.observe(time.monotonic() - event_started_at)
                 logger.error(
                     "Invalid order event was skipped",
                     extra={
@@ -194,10 +356,13 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
                 commit_message(consumer, message)
                 continue
 
-            event_started_at = time.monotonic()
+            database_started_at = time.monotonic()
             try:
                 inserted = insert_order(connection, event)
             except psycopg.Error as error:
+                metrics.database_duration.observe(time.monotonic() - database_started_at)
+                metrics.processing_duration.observe(time.monotonic() - event_started_at)
+                metrics.processing_errors.inc()
                 logger.error(
                     "Could not persist the order event",
                     extra={
@@ -209,11 +374,16 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
                 )
                 exit_code = 1
                 break
+            metrics.database_duration.observe(time.monotonic() - database_started_at)
 
             # The database transaction is committed before this offset commit.
             commit_message(consumer, message)
             handled_count += 1
             inserted_count += int(inserted)
+            metrics.orders_processed.inc()
+            duration_seconds = time.monotonic() - event_started_at
+            metrics.processing_duration.observe(duration_seconds)
+            duration_ms = duration_seconds * 1000
 
             logger.info(
                 "Order event processed",
@@ -222,10 +392,17 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
                     "event_id": str(event.event_id),
                     "order_id": str(event.order_id),
                     "inserted": inserted,
-                    "duration_ms": round((time.monotonic() - event_started_at) * 1000, 2),
+                    "duration_ms": round(duration_ms, 2),
                 },
             )
+            log_slow_processing(
+                logger,
+                event,
+                duration_ms,
+                arguments.slow_processing_threshold_ms,
+            )
     except KafkaException as error:
+        metrics.processing_errors.inc()
         logger.error(
             "Kafka consumer failed",
             extra={
@@ -238,6 +415,8 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
     finally:
         consumer.close()
         connection.close()
+        if metrics_server is not None:
+            metrics_server.close()
 
     logger.info(
         "Order consumer stopped",

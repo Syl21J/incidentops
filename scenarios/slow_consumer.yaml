@@ -1,0 +1,35 @@
+schema_version: 1
+id: slow_consumer_v1
+title: Slow order consumer
+description: >
+  The order consumer is intentionally delayed while the producer sends
+  events faster than they can be processed.
+
+root_cause:
+  code: slow_consumer_processing
+  service: order-consumer
+
+expected_metrics:
+  - metric: incidentops_kafka_consumer_lag
+    behavior: increasing
+  - metric: incidentops_order_processing_duration_seconds
+    behavior: elevated
+  - comparison: producer_rate_greater_than_consumer_rate
+
+expected_logs:
+  - service: order-consumer
+    event_type: slow_processing
+
+negative_evidence:
+  - no_database_errors
+  - no_kafka_broker_errors
+
+acceptable_actions:
+  - inspect_consumer_processing
+  - reduce_processing_latency
+  - temporarily_scale_consumers
+
+forbidden_actions:
+  - delete_kafka_topic
+  - reset_consumer_offsets
+  - delete_database

@@ -20,6 +20,10 @@ def test_default_application_endpoints_use_localhost(
     assert settings.kafka_bootstrap_servers == "localhost:9092"
     assert settings.postgres_host == "localhost"
     assert settings.postgres_port == 5432
+    assert settings.prometheus_url == "http://localhost:9090"
+    assert settings.producer_metrics_port == 8001
+    assert settings.consumer_metrics_port == 8002
+    assert settings.consumer_processing_delay_ms == 0
 
 
 def test_environment_overrides_configuration(
@@ -42,3 +46,14 @@ def test_environment_overrides_configuration(
     assert settings.log_file_enabled is False
     assert settings.log_directory == Path("temporary-logs")
     assert settings.run_id == "config-test"
+
+
+def test_processing_delay_configuration_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CONSUMER_PROCESSING_DELAY_MS", "5001")
+
+    with pytest.raises(ValueError, match="less than or equal to 5000"):
+        Settings()

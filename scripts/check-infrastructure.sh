@@ -105,7 +105,7 @@ wait_for_healthy() {
   return 1
 }
 
-for service in postgres elasticsearch kafka filebeat; do
+for service in postgres elasticsearch kafka filebeat prometheus; do
   wait_for_healthy "${service}"
 done
 
@@ -131,6 +131,18 @@ if ! curl --fail --silent --show-error "http://${elasticsearch_binding}/" >/dev/
   exit 1
 fi
 success "Elasticsearch answers on http://${elasticsearch_binding}/"
+
+# Prometheus health is independent from temporarily stopped scrape targets.
+prometheus_binding="$(docker compose port prometheus 9090 | tail -n 1)"
+if [[ -z "${prometheus_binding}" ]]; then
+  error "Could not resolve the Prometheus host port."
+  exit 1
+fi
+if ! curl --fail --silent --show-error "http://${prometheus_binding}/-/healthy" >/dev/null; then
+  error "Prometheus did not answer on http://${prometheus_binding}/-/healthy."
+  exit 1
+fi
+success "Prometheus answers on http://${prometheus_binding}/-/healthy"
 
 # A TCP connection from WSL verifies the externally published Kafka listener.
 kafka_binding="$(docker compose port kafka 9092 | tail -n 1)"

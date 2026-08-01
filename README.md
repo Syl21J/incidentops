@@ -1,6 +1,6 @@
 # IncidentOps
 
-IncidentOps implements a local order-processing path and centralized application-log search:
+IncidentOps implements a local order-processing path with logs and Prometheus metrics:
 
 ```text
 Order producer -> Kafka -> Order consumer -> PostgreSQL
@@ -18,9 +18,20 @@ Producer and consumer in WSL
               |
               v
  bounded Python search and aggregation tools in WSL
+
+Producer and consumer in WSL
+              |
+              +-- HTTP :8001/metrics and :8002/metrics
+              |
+              v
+ Prometheus 3.12.0 in Docker Compose
+              |
+              v
+ bounded typed metric tools in WSL
 ```
 
-The Python applications are not containerized. They always write JSON logs to stdout and can
+The Python applications are not containerized. They expose metrics directly from WSL and
+always write JSON logs to stdout and can
 also append the same records to local JSON Lines files. Filebeat is the only log shipper: it
 tails those files, remembers offsets in a persistent registry, and sends parsed fields to
 Elasticsearch. The applications have no Elasticsearch dependency and continue to process
@@ -28,7 +39,7 @@ orders when Filebeat or Elasticsearch is unavailable.
 
 ## Project status
 
-IncidentOps is an educational local-development project. The first three implementation
+IncidentOps is an educational local-development project. The first four implementation
 stages are complete:
 
 - PostgreSQL, Kafka, Elasticsearch, and Filebeat run as healthy Docker Compose services.
@@ -38,6 +49,9 @@ stages are complete:
   Filebeat, and searchable through bounded typed Python tools.
 - Unit tests cover configuration, logging, query construction, response validation, and
   processing behavior. Local integration and end-to-end scripts cover the real services.
+- Prometheus scrapes producer and consumer endpoints, typed tools expose bounded metric
+  summaries, and the versioned `slow_consumer_v1` scenario validates correlated metrics and
+  Elasticsearch logs.
 - GitHub Actions runs formatting, linting, type checking, and tests for every push to `main`
   and every pull request.
 
@@ -305,6 +319,133 @@ aggregation. Cleanup targets only that run's Kafka topic and group, PostgreSQL r
 processes/files, isolated JSONL subdirectory, and Elasticsearch documents selected by its exact
 `run_id`. It never deletes an application index or Docker volume.
 
+## Prometheus metrics architecture
+
+Prometheus 3.12.0 runs in Docker Compose with a six-hour/512 MB local retention limit and the
+named `prometheus_data` volume. It listens only on `127.0.0.1:9090`. The Python applications
+continue to run directly in WSL and bind their metrics endpoints to `0.0.0.0` so the
+Prometheus container can scrape them through `host.docker.internal` and the Compose
+`host-gateway` mapping. A stopped application can make its target temporarily `down`; this
+does not make Prometheus unhealthy.
+
+Start the infrastructure and open the UI at [http://localhost:9090](http://localhost:9090):
+
+```bash
+docker compose config
+docker compose up -d
+docker compose ps prometheus
+curl --fail http://localhost:9090/-/healthy
+```
+
+Start both application endpoints from WSL:
+
+```bash
+uv run python -m incidentops.consumer --run-id metrics-example
+
+uv run python -m incidentops.producer \
+  --count 100 \
+  --rate 10 \
+  --run-id metrics-example
+```
+
+The producer endpoint uses port 8001 and the consumer endpoint uses port 8002 by default.
+`--metrics-host`, `--metrics-port`, and `--no-metrics` provide explicit CLI control. Merely
+importing a module never starts a server, collectors use isolated registries, and no custom
+metric has an application label. In particular, `event_id`, `order_id`, `run_id`, and
+exception messages are never metric labels.
+
+### Custom metrics
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `incidentops_orders_produced_total` | Counter | Events whose Kafka delivery callback confirmed success |
+| `incidentops_order_production_errors_total` | Counter | Validation, production, delivery, topic, or flush failures |
+| `incidentops_order_production_duration_seconds` | Histogram | Produce-to-Kafka-confirmation delivery duration |
+| `incidentops_producer_target_rate` | Gauge | Configured target events per second |
+| `incidentops_orders_consumed_total` | Counter | Non-error Kafka messages received, including malformed messages |
+| `incidentops_orders_processed_total` | Counter | Valid messages completed after the database transaction, including idempotent duplicates |
+| `incidentops_order_processing_errors_total` | Counter | Malformed messages and processing/database failures |
+| `incidentops_order_processing_duration_seconds` | Histogram | Complete per-message path, including an enabled development delay |
+| `incidentops_database_operation_duration_seconds` | Histogram | PostgreSQL transaction duration only |
+| `incidentops_kafka_consumer_lag` | Gauge | Aggregate authoritative consumer-group lag across assigned partitions |
+
+Kafka lag is calculated per assigned partition as:
+
+```text
+max(0, Kafka high watermark - committed consumer-group offset)
+```
+
+Both Kafka values are next offsets: the high watermark is the next not-yet-written offset and
+the committed group offset is the next message to consume. If the group has no committed
+offset, the retained low watermark is used, so all currently retained records count as lag.
+The consumer refreshes this total at a bounded configurable interval. Collection failures
+produce a warning log and do not stop message processing.
+
+Useful manual PromQL in the UI:
+
+```promql
+incidentops_kafka_consumer_lag
+```
+
+```promql
+rate(incidentops_orders_produced_total[1m])
+```
+
+```promql
+rate(incidentops_orders_processed_total[1m])
+```
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le) (
+    rate(incidentops_order_processing_duration_seconds_bucket[5m])
+  )
+)
+```
+
+## Bounded metric CLI
+
+The metric client uses the Prometheus HTTP API with a five-second timeout, a six-hour maximum
+window, steps from 1 to 300 seconds, and response limits of 2 MB, 50 series, and 10,000
+samples. Public range queries accept only documented IncidentOps metric names and exact
+`job`/`instance` filters. The CLI exposes only predefined operations; arbitrary PromQL is not
+accepted.
+
+```bash
+uv run python -m incidentops.metric_query lag --minutes 10
+uv run python -m incidentops.metric_query rates --minutes 10
+uv run python -m incidentops.metric_query latency \
+  --percentile 0.95 \
+  --minutes 10
+```
+
+Every result is a Pydantic model rendered as readable JSON. The commands return non-zero for
+an unavailable Prometheus server, invalid input, oversized response, or missing samples.
+
+## Slow-consumer scenario
+
+The tracked ground truth is `scenarios/slow_consumer.yaml`. Its schema version, identity,
+root cause, expected metric behavior, expected logs, negative evidence, acceptable actions,
+and forbidden actions are validated by Pydantic. Run the single automated scenario with:
+
+```bash
+./scripts/check-slow-consumer-scenario.sh
+```
+
+It creates a unique topic, consumer group, `run_id`, JSONL directory, SQL row set, and
+Elasticsearch document set. It sends 80 deterministic events at 10/s while the consumer has
+an 800 ms development-only delay (about 1.25/s capacity) and a 500 ms slow threshold. The
+validation requires at least 30 messages of lag, P95 processing duration of at least 0.7 s,
+producer throughput above consumer throughput, `slow_processing` logs, and zero database or
+Kafka application errors. All waits use explicit deadlines.
+
+The delay defaults to zero and is accepted only from 0 through 5000 ms. It occurs inside the
+processing timer. The scenario stops the consumer within the bounded incident window instead
+of waiting for a full catch-up, then removes only resources created by its unique token. It
+does not delete any Docker volume, complete Elasticsearch index, shared topic, or unrelated
+database row.
+
 ## Local endpoints
 
 | Service | WSL endpoint | Container endpoint |
@@ -312,6 +453,9 @@ processes/files, isolated JSONL subdirectory, and Elasticsearch documents select
 | PostgreSQL | `localhost:5432` | `postgres:5432` |
 | Elasticsearch | `http://localhost:9200` | `http://elasticsearch:9200` |
 | Kafka | `localhost:9092` | `kafka:29092` |
+| Prometheus | `http://localhost:9090` | `prometheus:9090` |
+| Producer metrics | `http://localhost:8001/metrics` | `host.docker.internal:8001/metrics` |
+| Consumer metrics | `http://localhost:8002/metrics` | `host.docker.internal:8002/metrics` |
 
 ## Configuration
 
@@ -326,6 +470,15 @@ processes/files, isolated JSONL subdirectory, and Elasticsearch documents select
 | `POSTGRES_PASSWORD` | local placeholder | PostgreSQL password |
 | `POSTGRES_DB` | `incidentops` | PostgreSQL database |
 | `ELASTICSEARCH_URL` | `http://localhost:9200` | WSL search-client endpoint |
+| `PROMETHEUS_URL` | `http://localhost:9090` | WSL typed metric-client endpoint |
+| `PROMETHEUS_PORT` | `9090` | Prometheus loopback host port |
+| `PROMETHEUS_SCRAPE_INTERVAL` | `2s` | Documented development scrape interval |
+| `METRICS_HOST` | `0.0.0.0` | WSL bind address reachable from Docker |
+| `PRODUCER_METRICS_PORT` | `8001` | Producer metrics port |
+| `CONSUMER_METRICS_PORT` | `8002` | Consumer metrics port |
+| `CONSUMER_LAG_UPDATE_INTERVAL_SECONDS` | `2` | Authoritative lag refresh interval |
+| `CONSUMER_PROCESSING_DELAY_MS` | `0` | Development-only bounded delay; disabled by default |
+| `SLOW_PROCESSING_THRESHOLD_MS` | `500` | Threshold for `slow_processing` logs |
 | `LOG_LEVEL` | `INFO` | Application JSON log level |
 | `THIRD_PARTY_LOG_LEVEL` | `WARNING` | Separate Kafka/library log level |
 | `LOG_FILE_ENABLED` | `true` | Enable per-service JSONL files |
@@ -348,18 +501,18 @@ uv run pytest
 The workflow in `.github/workflows/ci.yml` executes these checks with Python 3.12 and the
 locked dependencies on every push to `main` and every pull request. Elasticsearch-dependent
 integration coverage skips when Elasticsearch is unavailable in the CI runner. Run
-`./scripts/check-pipeline.sh` and `./scripts/check-log-pipeline.sh` locally for real
-Kafka/PostgreSQL and log-pipeline validation.
+`./scripts/check-pipeline.sh`, `./scripts/check-log-pipeline.sh`, and
+`./scripts/check-slow-consumer-scenario.sh` locally for real service validation.
 
 ## Next steps
 
-The current milestone stops after centralized log collection and search. Potential future
+The current milestone stops after Prometheus metrics and the single slow-consumer scenario.
+Potential future
 stages, each requiring an explicit implementation request, are:
 
-1. Add Prometheus metrics and Grafana dashboards without replacing the Elasticsearch log
-   path.
-2. Define controlled incident scenarios and service-level indicators.
-3. Add runbook retrieval and agent workflows only after the observability foundations are
+1. Add Grafana only after an explicit implementation request.
+2. Define additional incident scenarios and service-level indicators separately.
+3. Add runbook retrieval, LangGraph, and agent workflows only after the observability foundations are
    validated.
 4. Evaluate OpenTelemetry, MCP, Kubernetes, and application containerization separately
    rather than expanding the local MVP implicitly.
@@ -393,6 +546,24 @@ IncidentOps is available under the [MIT License](LICENSE).
   memory, and `sysctl vm.max_map_count`.
 - **A port is already used:** change the corresponding host port in `.env`, then run
   `docker compose config` before restarting.
+- **Prometheus cannot reach WSL services:** confirm the application binds `METRICS_HOST` to
+  `0.0.0.0`, verify `host.docker.internal` resolves inside the container, and test
+  `wget -qO- http://host.docker.internal:8001/metrics` from `docker compose exec prometheus`.
+- **Producer or consumer target is down:** start that Python process, open its `/metrics`
+  endpoint from WSL, then inspect `http://localhost:9090/targets`. A stopped application target
+  is expected and does not affect the Prometheus container healthcheck.
+- **Port 8001, 8002, or 9090 is occupied:** stop the unrelated owner or configure an unused
+  application/host port. If application ports change, update the versioned Prometheus scrape
+  targets consistently, run `docker compose config`, and restart Prometheus.
+- **No lag samples are available:** wait for the consumer partition assignment and at least
+  two scrapes, check the consumer `lag_collection_failed` warnings, and confirm the topic and
+  consumer group match the running process.
+- **Histogram queries return no value:** process multiple messages, wait for at least two
+  scrapes within the 30-second or manual query rate window, and verify the consumer target is
+  healthy during collection.
+- **`slow_processing` logs are missing:** ensure the explicit delay exceeds the configured
+  threshold, `LOG_FILE_ENABLED=true`, Filebeat is healthy, and the log query uses the scenario
+  `run_id` and a current time window.
 - **Kafka is unavailable through localhost:** WSL applications must use
   `localhost:${KAFKA_EXTERNAL_PORT}`; containers must use `kafka:29092`.
 - **A pipeline check times out:** inspect the temporary consumer stdout path printed by the

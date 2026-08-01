@@ -35,7 +35,16 @@ class Settings(BaseSettings):
     run_id: str = "local"
 
     elasticsearch_url: str = "http://localhost:9200"
+    prometheus_url: str = "http://localhost:9090"
     order_random_seed: int = 42
+
+    metrics_enabled: bool = True
+    metrics_host: str = "0.0.0.0"
+    producer_metrics_port: int = Field(default=8001, ge=1, le=65535)
+    consumer_metrics_port: int = Field(default=8002, ge=1, le=65535)
+    consumer_lag_update_interval_seconds: float = Field(default=2.0, ge=0.5, le=60.0)
+    consumer_processing_delay_ms: int = Field(default=0, ge=0, le=5_000)
+    slow_processing_threshold_ms: int = Field(default=500, ge=0, le=60_000)
 
     @field_validator(
         "kafka_bootstrap_servers",
@@ -46,6 +55,8 @@ class Settings(BaseSettings):
         "postgres_db",
         "run_id",
         "elasticsearch_url",
+        "prometheus_url",
+        "metrics_host",
     )
     @classmethod
     def reject_blank_values(cls, value: str) -> str:

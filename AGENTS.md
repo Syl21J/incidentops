@@ -11,5 +11,9 @@
 - Never delete a complete Elasticsearch index without explicit authorization.
 - Never execute a raw Elasticsearch query produced at runtime by an LLM.
 - Preserve the enforced time-window and result-size limits in log searches.
+- Never add high-cardinality Prometheus labels such as event, order, run, or exception values.
+- Never expose unrestricted PromQL to an LLM; preserve metric allowlists and query bounds.
+- Never delete the `prometheus_data` volume or other Prometheus storage without explicit authorization.
+- Keep all incident injection disabled by default.
 - Keep services simple, typed, testable, and limited to the current requirement.
-- Do not add unrelated services or begin Prometheus, agents, RAG, MCP, Kubernetes, or incident scenarios without an explicit request.
+- Do not add unrelated services or begin LangGraph, Grafana, agents, RAG, MCP, Kubernetes, or additional incident scenarios without an explicit request.

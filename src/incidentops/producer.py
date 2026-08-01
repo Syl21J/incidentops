@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from incidentops.config import Settings, get_settings
 from incidentops.logging import configure_logging, get_third_party_logger
+from incidentops.metrics import MetricsServer, create_producer_metrics
 from incidentops.models import generate_order_event
 
 SERVICE_NAME = "order-producer"
@@ -46,6 +47,15 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def positive_integer(value: str) -> int:
+    """Parse an integer in the TCP port range."""
+
+    parsed = int(value)
+    if not 1 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("value must be between 1 and 65535")
     return parsed
 
 
@@ -105,6 +115,17 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-servers", default=settings.kafka_bootstrap_servers)
     parser.add_argument("--topic", default=settings.kafka_topic)
     parser.add_argument("--log-level", default=settings.log_level)
+    parser.add_argument("--metrics-host", default=settings.metrics_host)
+    parser.add_argument(
+        "--metrics-port", type=positive_integer, default=settings.producer_metrics_port
+    )
+    parser.add_argument(
+        "--no-metrics",
+        action="store_false",
+        dest="metrics_enabled",
+        default=settings.metrics_enabled,
+        help="Disable the Prometheus endpoint (primarily for isolated tests).",
+    )
     return parser
 
 
@@ -123,6 +144,26 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
     shutdown_requested = Event()
     summary = DeliverySummary()
     started_at = time.monotonic()
+    metrics = create_producer_metrics()
+    metrics.target_rate.set(arguments.rate)
+    metrics_server: MetricsServer | None = None
+
+    if arguments.metrics_enabled:
+        try:
+            metrics_server = MetricsServer.start(
+                host=arguments.metrics_host,
+                port=arguments.metrics_port,
+                registry=metrics.registry,
+            )
+        except OSError as error:
+            logger.error(
+                "Could not start the Prometheus metrics endpoint",
+                extra={
+                    "event_type": "metrics_start_failed",
+                    "error_type": type(error).__name__,
+                },
+            )
+            return 1
 
     def request_shutdown(signum: int, _frame: FrameType | None) -> None:
         shutdown_requested.set()
@@ -142,6 +183,7 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             third_party_logger,
         )
     except KafkaException as error:
+        metrics.production_errors.inc()
         logger.error(
             "Could not create or inspect the Kafka topic",
             extra={
@@ -150,6 +192,8 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
                 "error_type": type(error).__name__,
             },
         )
+        if metrics_server is not None:
+            metrics_server.close()
         return 1
 
     producer = Producer(
@@ -163,9 +207,14 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
         logger=third_party_logger,
     )
 
-    def delivery_report(error: KafkaError | None, message: Message) -> None:
+    def delivery_report(
+        error: KafkaError | None,
+        message: Message,
+        delivery_started_at: float,
+    ) -> None:
         if error is not None:
             summary.failed += 1
+            metrics.production_errors.inc()
             logger.error(
                 "Order event delivery failed",
                 extra={
@@ -176,6 +225,8 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             )
             return
         summary.sent += 1
+        metrics.orders_produced.inc()
+        metrics.production_duration.observe(time.monotonic() - delivery_started_at)
 
     interval_seconds = 1 / arguments.rate
     next_delivery_at = time.monotonic()
@@ -198,6 +249,7 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
                 )
             except (ValidationError, ValueError) as error:
                 summary.failed += 1
+                metrics.production_errors.inc()
                 logger.error(
                     "Generated order event failed validation",
                     extra={
@@ -209,20 +261,36 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
 
             while not shutdown_requested.is_set():
                 try:
+                    delivery_started_at = time.monotonic()
                     producer.produce(
                         topic=arguments.topic,
                         key=str(event.event_id).encode("utf-8"),
                         value=event.to_json_bytes(),
-                        on_delivery=delivery_report,
+                        on_delivery=lambda error, message, started=delivery_started_at: (
+                            delivery_report(error, message, started)
+                        ),
                     )
                     break
                 except BufferError:
                     producer.poll(0.5)
+                except KafkaException as error:
+                    summary.failed += 1
+                    metrics.production_errors.inc()
+                    logger.error(
+                        "Order event production failed",
+                        extra={
+                            "event_type": "producer_error",
+                            "error_type": type(error).__name__,
+                            "topic": arguments.topic,
+                        },
+                    )
+                    break
 
             producer.poll(0)
             next_delivery_at += interval_seconds
     except KafkaException as error:
         summary.failed += 1
+        metrics.production_errors.inc()
         logger.error(
             "Kafka producer failed",
             extra={
@@ -234,6 +302,8 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
     finally:
         undelivered = producer.flush(15)
         summary.failed += undelivered
+        if undelivered:
+            metrics.production_errors.inc(undelivered)
 
     duration_ms = round((time.monotonic() - started_at) * 1000, 2)
     logger.info(
@@ -246,6 +316,8 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             "duration_ms": duration_ms,
         },
     )
+    if metrics_server is not None:
+        metrics_server.close()
     return 0 if summary.failed == 0 else 1
 
 
