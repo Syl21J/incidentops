@@ -18,12 +18,16 @@ def test_default_application_endpoints_use_localhost(
     settings = Settings()
 
     assert settings.kafka_bootstrap_servers == "localhost:9092"
+    assert settings.kafka_auto_offset_reset == "earliest"
     assert settings.postgres_host == "localhost"
     assert settings.postgres_port == 5432
     assert settings.prometheus_url == "http://localhost:9090"
     assert settings.producer_metrics_port == 8001
     assert settings.consumer_metrics_port == 8002
     assert settings.consumer_processing_delay_ms == 0
+    assert settings.llm_provider == "openai-compatible"
+    assert settings.llm_temperature == 0
+    assert settings.investigation_max_tool_calls == 10
 
 
 def test_environment_overrides_configuration(
@@ -56,4 +60,15 @@ def test_processing_delay_configuration_is_bounded(
     monkeypatch.setenv("CONSUMER_PROCESSING_DELAY_MS", "5001")
 
     with pytest.raises(ValueError, match="less than or equal to 5000"):
+        Settings()
+
+
+def test_kafka_offset_reset_policy_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KAFKA_AUTO_OFFSET_RESET", "invalid")
+
+    with pytest.raises(ValueError, match="earliest"):
         Settings()

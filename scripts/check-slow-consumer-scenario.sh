@@ -4,6 +4,51 @@ set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+retain_investigation_data=false
+output_metadata=""
+
+usage() {
+  cat <<'EOF'
+Usage: check-slow-consumer-scenario.sh [OPTIONS]
+
+Options:
+  --retain-investigation-data  Keep this run's Elasticsearch documents for a follow-up workflow.
+  --output-metadata PATH       Write exact scenario timestamps, identifiers, and observations as JSON.
+  --help                       Show this help message.
+EOF
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --retain-investigation-data)
+      retain_investigation_data=true
+      shift
+      ;;
+    --output-metadata)
+      if (( $# < 2 )); then
+        printf '[ERROR] --output-metadata requires a path.\n' >&2
+        exit 2
+      fi
+      output_metadata="$2"
+      shift 2
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf '[ERROR] Unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "${retain_investigation_data}" == "true" && -z "${output_metadata}" ]]; then
+  printf '[ERROR] --retain-investigation-data requires --output-metadata.\n' >&2
+  exit 2
+fi
+
 readonly TEST_TOKEN="$(date +%s)-$$"
 readonly RUN_ID="slow-consumer-${TEST_TOKEN}"
 readonly TEST_TOPIC="orders.slow-consumer.${TEST_TOKEN}"
@@ -28,6 +73,8 @@ consumer_pid=""
 topic_created=false
 group_created=false
 scenario_start=""
+scenario_end=""
+investigation_data_ready=false
 
 log() {
   printf '[INFO] %s\n' "$*"
@@ -115,7 +162,9 @@ cleanup() {
     rm -rf -- "${RUN_LOG_DIR}"
   fi
 
-  if ! RUN_ID_TO_DELETE="${RUN_ID}" uv run python - <<'PY'
+  if [[ "${retain_investigation_data}" == "true" && "${investigation_data_ready}" == "true" ]]; then
+    log "Retaining Elasticsearch documents for bounded follow-up investigation"
+  elif ! RUN_ID_TO_DELETE="${RUN_ID}" uv run python - <<'PY'
 import os
 
 from elasticsearch import Elasticsearch
@@ -281,7 +330,7 @@ raise SystemExit(0 if {"incidentops-producer", "incidentops-consumer"} <= health
   fi
   if (( SECONDS >= targets_deadline )); then
     error "Timed out waiting for healthy Prometheus application targets."
-    curl --silent http://localhost:9090/api/v1/targets >&2 || true
+    curl --silent http://localhost:9090/api/v1/targets >&2
     exit 1
   fi
   sleep 1
@@ -380,7 +429,9 @@ PY
   fi
   if (( SECONDS >= metric_deadline )); then
     error "Timed out waiting for lag, latency, and rate evidence."
-    sed -n '1,240p' "${METRIC_RESULT}" >&2 || true
+    if [[ -f "${METRIC_RESULT}" ]]; then
+      sed -n '1,240p' "${METRIC_RESULT}" >&2
+    fi
     sed -n '1,240p' "${CONSUMER_STDOUT}" >&2
     exit 1
   fi
@@ -392,7 +443,10 @@ PY
 done
 success "Lag, P95 latency, and throughput assertions passed"
 
-processed_during_incident="$(grep -c '"event_type":"order_processed"' "${CONSUMER_STDOUT}" || true)"
+processed_during_incident="$(
+  awk '/"event_type":"order_processed"/ { count++ } END { print count + 0 }' \
+    "${CONSUMER_STDOUT}"
+)"
 
 log "Waiting for structured scenario logs in Elasticsearch"
 log_deadline=$((SECONDS + WAIT_TIMEOUT_SECONDS))
@@ -464,6 +518,7 @@ if pgrep -f "incidentops\.(producer|consumer).*${RUN_ID}" >/dev/null 2>&1; then
   exit 1
 fi
 success "All temporary application processes are stopped"
+scenario_end="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 read -r maximum_lag p95_seconds producer_rate consumer_rate < <(
   uv run python - "${METRIC_RESULT}" <<'PY'
@@ -480,6 +535,57 @@ print(
 )
 PY
 )
+
+if [[ -n "${output_metadata}" ]]; then
+  uv run python - \
+    "${output_metadata}" \
+    "${METRIC_RESULT}" \
+    "${RUN_ID}" \
+    "${TEST_TOPIC}" \
+    "${TEST_GROUP}" \
+    "${scenario_start}" \
+    "${scenario_end}" \
+    "${slow_log_count}" \
+    "${database_error_count}" \
+    "${kafka_error_count}" <<'PY'
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+output_path = Path(sys.argv[1])
+metric_path = Path(sys.argv[2])
+payload = {
+    "schema_version": 1,
+    "scenario_id": "slow_consumer_v1",
+    "run_id": sys.argv[3],
+    "topic": sys.argv[4],
+    "consumer_group": sys.argv[5],
+    "start_time": sys.argv[6],
+    "end_time": sys.argv[7],
+    "observations": {
+        **json.loads(metric_path.read_text(encoding="utf-8")),
+        "slow_processing_log_count": int(sys.argv[8]),
+        "database_error_count": int(sys.argv[9]),
+        "kafka_error_count": int(sys.argv[10]),
+    },
+}
+output_path.parent.mkdir(parents=True, exist_ok=True)
+with tempfile.NamedTemporaryFile(
+    mode="w",
+    encoding="utf-8",
+    dir=output_path.parent,
+    prefix=f".{output_path.name}.",
+    delete=False,
+) as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    temporary_path = Path(handle.name)
+temporary_path.replace(output_path)
+PY
+  investigation_data_ready=true
+  success "Scenario metadata written to ${output_metadata}"
+fi
 
 printf '\nIncidentOps slow-consumer scenario validation succeeded.\n'
 printf 'Run ID: %s\n' "${RUN_ID}"

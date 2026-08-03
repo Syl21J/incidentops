@@ -39,7 +39,7 @@ orders when Filebeat or Elasticsearch is unavailable.
 
 ## Project status
 
-IncidentOps is an educational local-development project. The first four implementation
+IncidentOps is an educational local-development project. The first five implementation
 stages are complete:
 
 - PostgreSQL, Kafka, Elasticsearch, and Filebeat run as healthy Docker Compose services.
@@ -52,6 +52,9 @@ stages are complete:
 - Prometheus scrapes producer and consumer endpoints, typed tools expose bounded metric
   summaries, and the versioned `slow_consumer_v1` scenario validates correlated metrics and
   Elasticsearch logs.
+- A bounded LangGraph workflow plans and investigates `slow_consumer_v1` using the live typed
+  Prometheus and Elasticsearch tools, validates model output with Pydantic, verifies evidence
+  deterministically, and produces an evaluated structured report.
 - GitHub Actions runs formatting, linting, type checking, and tests for every push to `main`
   and every pull request.
 
@@ -377,9 +380,10 @@ max(0, Kafka high watermark - committed consumer-group offset)
 
 Both Kafka values are next offsets: the high watermark is the next not-yet-written offset and
 the committed group offset is the next message to consume. If the group has no committed
-offset, the retained low watermark is used, so all currently retained records count as lag.
-The consumer refreshes this total at a bounded configurable interval. Collection failures
-produce a warning log and do not stop message processing.
+offset, the fallback mirrors `KAFKA_AUTO_OFFSET_RESET`: `earliest` uses the retained low
+watermark, `latest` uses the high watermark, and `error` reports lag as unavailable. The
+consumer refreshes this total at a bounded configurable interval. Collection failures produce
+a warning log and do not stop message processing.
 
 Useful manual PromQL in the UI:
 
@@ -446,6 +450,183 @@ of waiting for a full catch-up, then removes only resources created by its uniqu
 does not delete any Docker volume, complete Elasticsearch index, shared topic, or unrelated
 database row.
 
+## Bounded LangGraph investigation workflow
+
+The first investigation workflow diagnoses the existing `slow_consumer_v1` scenario from a
+caller-supplied UTC window. LangGraph orchestrates fixed nodes and conditional edges; it does
+not give the model control over graph topology, queries, permissions, or termination.
+
+```text
+validate
+   |
+   v
+plan
+   |
+   +-----------> metrics ---------+
+   |                              |
+   +-----------> logs ------------+--> hypotheses --> verify --+--> report
+                                                              |
+                                                              +--> one recheck --> report
+```
+
+The metrics and logs nodes are workflow branches with shared typed state. They are not
+independent autonomous agents. A future multi-agent system would introduce separate roles,
+delegation, and coordination boundaries; none of those exist in this stage.
+
+| Node | Responsibility |
+| --- | --- |
+| `validate_incident` | Validate scope, supported services, UTC timestamps, `run_id`, and the six-hour maximum window |
+| `plan_investigation` | Request a two-to-six-task structured plan and deterministically require the complete allowlisted baseline |
+| `collect_metrics` | Execute selected numerical Prometheus summaries |
+| `collect_logs` | Execute selected structured Elasticsearch checks and preserve zero-result checks as negative evidence |
+| `generate_hypotheses` | Request at most three closed-code hypotheses citing existing evidence identifiers |
+| `verify_hypotheses` | Check evidence references, values, window membership, competing causes, and negative evidence in Python |
+| `targeted_recheck` | Execute only missing allowlisted tasks, once, within the remaining call budget |
+| `generate_report` | Assemble the final report deterministically from verified state |
+
+All paths terminate. A recheck is possible only when deterministic verification returns
+`needs_more_evidence`, identifies missing tasks, and both the attempt and tool-call budgets
+permit it. Otherwise the graph returns `diagnosed`, `insufficient_evidence`,
+`conflicting_evidence`, `out_of_scope`, or `pipeline_error`.
+
+### Bounded tools and evidence
+
+The planner can select only these six task codes:
+
+| Task code | Existing deterministic implementation | Bound |
+| --- | --- | --- |
+| `check_consumer_lag` | Prometheus consumer-lag summary | Exact incident window |
+| `check_processing_latency` | Prometheus fixed P95 processing-latency summary | Exact incident window |
+| `compare_producer_consumer_rates` | Prometheus fixed windowed-rate comparison | Exact incident window |
+| `find_slow_processing_logs` | Elasticsearch structured `slow_processing` search | `run_id` when supplied, at most 100 timeline entries |
+| `find_database_errors` | Elasticsearch database-event search | Zero matches become explicit negative evidence |
+| `find_kafka_errors` | Elasticsearch Kafka-event search | Zero matches become explicit negative evidence |
+
+The wrappers reuse `incidentops.metric_query` and `incidentops.log_search`. They expose no raw
+PromQL, Elasticsearch DSL, shell, Docker, Kafka administration, database writes, offset reset,
+or deletion capability. The hard workflow limits are a six-hour range, ten tool calls, two
+investigation attempts, one recheck, three hypotheses, and four structured model calls.
+Backend requests have explicit timeouts and bounded response sizes.
+
+Each metric, log, and negative-evidence item is a strict Pydantic model containing a stable
+`evidence_id`, source, observation, UTC window, numerical or count summary, availability, and
+collection attempt. Examples include `metric-consumer-lag-summary`,
+`log-slow-processing-summary`, and `negative-no-database-errors`. Log messages and incident
+descriptions are untrusted data: instruction-like text inside them cannot add tools or alter
+workflow limits.
+
+The model returns only closed task, root-cause, and evidence-reference schemas. It does not
+calculate maxima, percentiles, rates, trends, or log counts. The verifier rejects unknown
+evidence identifiers, evidence outside the incident window, unsupported claims, inconsistent
+counts, missing negative checks, and positive diagnoses without support. Recommended actions
+come from a closed enum and are assembled only after verification.
+
+The producer target rate, active producer throughput, and Prometheus windowed `rate()` values
+remain separate concepts. Investigation reports use the collected windowed rates and never
+present the configured target as observed throughput.
+
+### Model provider configuration
+
+Production mode uses an OpenAI-compatible chat endpoint through the minimal
+`langchain-openai` integration. Secrets are read only from environment variables. Temperature
+defaults to zero, the request timeout is explicit, retries are limited, and every response is
+validated against the requested Pydantic schema. There is no automatic fake-model fallback.
+
+```dotenv
+LLM_PROVIDER=openai-compatible
+LLM_MODEL=replace-with-model-name
+LLM_BASE_URL=
+LLM_API_KEY=replace-with-api-key
+LLM_TEMPERATURE=0
+LLM_TIMEOUT_SECONDS=30
+LLM_MAX_RETRIES=1
+```
+
+Leave `LLM_BASE_URL` empty for the provider default or set it to a compatible endpoint. Replace
+both placeholders before a live investigation. Missing or placeholder credentials fail before
+the workflow contacts Prometheus, Elasticsearch, or an external model.
+
+Automated validation uses an explicit non-production provider:
+
+```text
+--model-provider scripted-test
+```
+
+The scripted provider traverses the same structured-output validation paths as the live
+provider. It still uses real Prometheus and Elasticsearch data, and the deterministic verifier
+still decides whether the proposed cause is supported. No automated test requires an external
+API key.
+
+### Investigation CLI and local artifacts
+
+Run a live-provider investigation with an exact scenario or operator-supplied window:
+
+```bash
+uv run python -m incidentops.investigation.cli investigate \
+  --description "Orders have been delayed for the last few minutes." \
+  --start-time "2026-08-01T13:00:00Z" \
+  --end-time "2026-08-01T13:10:00Z" \
+  --run-id "manual-test-001" \
+  --affected-service order-consumer \
+  --output-format markdown \
+  --output-file incident-report.md \
+  --persist-artifacts
+```
+
+Use `--output-format json` for the validated JSON representation. A pipeline error returns a
+non-zero process status; `insufficient_evidence` is a valid completed result. With
+`--persist-artifacts`, the workflow writes one JSON report and one low-cardinality JSONL trace
+under `artifacts/investigations/`. That generated directory is ignored by Git. Traces record
+node and tool lifecycle events without secrets or high-cardinality Prometheus labels.
+
+A successful report has this shape, with the complete evidence objects omitted here only for
+readability:
+
+```json
+{
+  "status": "diagnosed",
+  "primary_root_cause": {
+    "cause_code": "slow_consumer_processing",
+    "confidence": 0.9,
+    "supporting_evidence_ids": [
+      "metric-consumer-lag-summary",
+      "metric-processing-latency-p95",
+      "metric-producer-consumer-rate-comparison",
+      "log-slow-processing-summary",
+      "negative-no-database-errors",
+      "negative-no-kafka-errors"
+    ]
+  },
+  "tool_call_count": 6,
+  "investigation_attempts": 1
+}
+```
+
+### Scenario-driven evaluation
+
+The evaluator is deliberately outside the investigation graph. It may read
+`scenarios/slow_consumer.yaml`; the graph never receives the expected cause, evidence, or
+actions.
+
+```bash
+uv run python -m incidentops.evaluation.cli \
+  --report artifacts/investigations/<investigation-id>.report.json \
+  --scenario scenarios/slow_consumer.yaml
+```
+
+It reports exact root-cause match and rank, expected metric/log/negative-evidence recall,
+unsupported evidence references, forbidden actions, tool calls, attempts, and workflow
+duration. The complete live-data validation runs the scenario, retains its Elasticsearch
+documents only long enough to investigate them, evaluates the report, and deletes those exact
+documents by `run_id`:
+
+```bash
+./scripts/check-agent-workflow.sh
+```
+
+The first workflow is validated only for `slow_consumer_v1`. It has no runbook knowledge, RAG,
+multi-agent supervisor, remediation tools, hosted tracing, or automatic actions.
+
 ## Local endpoints
 
 | Service | WSL endpoint | Container endpoint |
@@ -464,6 +645,7 @@ database row.
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka endpoint used by Python applications |
 | `KAFKA_TOPIC` | `orders.v1` | Order event topic |
 | `KAFKA_CONSUMER_GROUP` | `incidentops-order-consumer-v1` | Consumer group |
+| `KAFKA_AUTO_OFFSET_RESET` | `earliest` | Closed missing-offset fallback: `earliest`, `latest`, or `error` |
 | `POSTGRES_HOST` | `localhost` | PostgreSQL host used by Python |
 | `POSTGRES_PORT` | `5432` | PostgreSQL host port |
 | `POSTGRES_USER` | `incidentops` | PostgreSQL user |
@@ -485,6 +667,17 @@ database row.
 | `LOG_DIRECTORY` | `logs` | JSONL directory mounted by Filebeat |
 | `RUN_ID` | `local` | Default cross-service log correlation ID |
 | `ORDER_RANDOM_SEED` | `42` | Deterministic event generation seed |
+| `LLM_PROVIDER` | `openai-compatible` | Live provider; `scripted-test` must be selected explicitly |
+| `LLM_MODEL` | unset | Required live chat-model name |
+| `LLM_BASE_URL` | provider default | Optional OpenAI-compatible endpoint |
+| `LLM_API_KEY` | unset | Required live secret, read only from the environment |
+| `LLM_TEMPERATURE` | `0` | Structured model temperature |
+| `LLM_TIMEOUT_SECONDS` | `30` | Live model request timeout |
+| `LLM_MAX_RETRIES` | `1` | Bounded live request retry count |
+| `INVESTIGATION_MAX_TIME_RANGE_HOURS` | `6` | Hard maximum incident window |
+| `INVESTIGATION_MAX_TOOL_CALLS` | `10` | Hard tool-call budget |
+| `INVESTIGATION_MAX_ATTEMPTS` | `2` | Initial collection plus at most one recheck |
+| `INVESTIGATION_ARTIFACT_DIRECTORY` | `artifacts/investigations` | Ignored local report and trace directory |
 
 Tests call the logging configuration with file output disabled or point it at pytest temporary
 directories, so unit tests do not write to the real `logs/` directory.
@@ -501,20 +694,22 @@ uv run pytest
 The workflow in `.github/workflows/ci.yml` executes these checks with Python 3.12 and the
 locked dependencies on every push to `main` and every pull request. Elasticsearch-dependent
 integration coverage skips when Elasticsearch is unavailable in the CI runner. Run
-`./scripts/check-pipeline.sh`, `./scripts/check-log-pipeline.sh`, and
-`./scripts/check-slow-consumer-scenario.sh` locally for real service validation.
+`./scripts/check-pipeline.sh`, `./scripts/check-log-pipeline.sh`,
+`./scripts/check-slow-consumer-scenario.sh`, and `./scripts/check-agent-workflow.sh` locally for
+real service validation. The agent workflow check uses the explicit scripted provider but real
+Prometheus and Elasticsearch tools, so it never requires a live model API key.
 
 ## Next steps
 
-The current milestone stops after Prometheus metrics and the single slow-consumer scenario.
-Potential future
-stages, each requiring an explicit implementation request, are:
+The current milestone stops after the first bounded LangGraph workflow for the single
+slow-consumer scenario. Potential future stages, each requiring an explicit implementation
+request, are:
 
 1. Add Grafana only after an explicit implementation request.
 2. Define additional incident scenarios and service-level indicators separately.
-3. Add runbook retrieval, LangGraph, and agent workflows only after the observability foundations are
-   validated.
-4. Evaluate OpenTelemetry, MCP, Kubernetes, and application containerization separately
+3. Add runbook retrieval and RAG only as a separately validated stage.
+4. Add a multi-agent supervisor only after independent agent roles are explicitly designed.
+5. Evaluate OpenTelemetry, MCP, Kubernetes, and application containerization separately
    rather than expanding the local MVP implicitly.
 
 ## License

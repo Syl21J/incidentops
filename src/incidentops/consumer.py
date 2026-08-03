@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 from types import FrameType
+from typing import Literal
 
 import psycopg
 from confluent_kafka import Consumer, KafkaError, KafkaException, Message, TopicPartition
@@ -18,6 +19,7 @@ from incidentops.metrics import ConsumerMetrics, MetricsServer, create_consumer_
 from incidentops.models import OrderEvent
 
 SERVICE_NAME = "order-consumer"
+OffsetResetPolicy = Literal["earliest", "latest", "error"]
 
 
 def positive_integer(value: str) -> int:
@@ -65,14 +67,26 @@ def slow_threshold_ms(value: str) -> int:
     return parsed
 
 
-def calculate_partition_lag(low_offset: int, high_offset: int, committed_offset: int) -> int:
-    """Return retained messages after the committed next offset, never below zero.
+def calculate_partition_lag(
+    low_offset: int,
+    high_offset: int,
+    committed_offset: int,
+    *,
+    reset_policy: OffsetResetPolicy = "earliest",
+) -> int | None:
+    """Return retained messages after the effective next offset.
 
     Kafka reports an invalid negative offset when a group has not committed. In that
-    case the retained low watermark is the safe effective starting offset.
+    case the fallback mirrors ``auto.offset.reset``. The ``error`` policy deliberately
+    reports lag as unavailable instead of inventing an effective offset.
     """
 
-    effective_committed = low_offset if committed_offset < low_offset else committed_offset
+    if committed_offset < low_offset:
+        if reset_policy == "error":
+            return None
+        effective_committed = low_offset if reset_policy == "earliest" else high_offset
+    else:
+        effective_committed = committed_offset
     return max(0, high_offset - effective_committed)
 
 
@@ -80,8 +94,9 @@ def collect_total_consumer_lag(
     consumer: Consumer,
     partitions: list[TopicPartition],
     *,
+    reset_policy: OffsetResetPolicy = "earliest",
     timeout: float = 1.0,
-) -> int:
+) -> int | None:
     """Sum authoritative Kafka high-watermark minus committed offsets."""
 
     if not partitions:
@@ -95,7 +110,15 @@ def collect_total_consumer_lag(
             timeout=timeout,
             cached=False,
         )
-        total += calculate_partition_lag(low, high, partition.offset)
+        partition_lag = calculate_partition_lag(
+            low,
+            high,
+            partition.offset,
+            reset_policy=reset_policy,
+        )
+        if partition_lag is None:
+            return None
+        total += partition_lag
     return total
 
 
@@ -240,7 +263,7 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             "group.id": arguments.group,
             "client.id": SERVICE_NAME,
             "enable.auto.commit": False,
-            "auto.offset.reset": "earliest",
+            "auto.offset.reset": settings.kafka_auto_offset_reset,
             "enable.partition.eof": True,
         },
         logger=third_party_logger,
@@ -281,9 +304,23 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             now = time.monotonic()
             if assigned_partitions and now >= next_lag_update_at:
                 try:
-                    metrics.kafka_consumer_lag.set(
-                        collect_total_consumer_lag(consumer, assigned_partitions)
+                    total_lag = collect_total_consumer_lag(
+                        consumer,
+                        assigned_partitions,
+                        reset_policy=settings.kafka_auto_offset_reset,
                     )
+                    if total_lag is None:
+                        metrics.kafka_consumer_lag.set(float("nan"))
+                        logger.warning(
+                            "Kafka consumer lag is unavailable without a committed offset",
+                            extra={
+                                "event_type": "lag_unavailable",
+                                "topic": arguments.topic,
+                                "consumer_group": arguments.group,
+                            },
+                        )
+                    else:
+                        metrics.kafka_consumer_lag.set(total_lag)
                 except (KafkaException, RuntimeError) as error:
                     logger.warning(
                         "Kafka consumer lag collection failed",

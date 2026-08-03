@@ -23,6 +23,9 @@ build/
 # Application JSON Lines logs
 logs/
 
+# Generated local investigation reports and traces
+artifacts/investigations/
+
 # Editors and operating systems
 .idea/
 .vscode/
