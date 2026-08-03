@@ -351,6 +351,18 @@ uv run python -m incidentops.producer \
   --run-id metrics-example
 ```
 
+For the same normal, isolated demonstration in one command:
+
+```bash
+./scripts/run-prometheus-demo.sh
+```
+
+The script starts and checks Compose, uses a unique topic, group, and `run_id`, verifies both
+targets as `UP`, then prints the bounded lag, rate, and P95 summaries. It leaves recent metric
+samples in Prometheus but removes only the temporary Kafka and PostgreSQL resources it created.
+The event count and producer rate can be adjusted with `PROMETHEUS_DEMO_EVENT_COUNT` and
+`PROMETHEUS_DEMO_PRODUCER_RATE`.
+
 The producer endpoint uses port 8001 and the consumer endpoint uses port 8002 by default.
 `--metrics-host`, `--metrics-port`, and `--no-metrics` provide explicit CLI control. Merely
 importing a module never starts a server, collectors use isolated registries, and no custom

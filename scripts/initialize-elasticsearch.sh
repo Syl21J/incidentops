@@ -8,11 +8,15 @@ readonly TEMPLATE_FILE="${PROJECT_DIR}/elasticsearch/index-template.json"
 readonly TEMPLATE_NAME="incidentops-logs"
 readonly ELASTICSEARCH_URL="${ELASTICSEARCH_URL:-http://localhost:9200}"
 readonly WAIT_TIMEOUT_SECONDS="${ELASTICSEARCH_INIT_TIMEOUT:-120}"
-readonly TEMP_DIR="$(mktemp -d -t incidentops-elasticsearch-init.XXXXXX)"
+TEMP_DIR="$(mktemp -d -t incidentops-elasticsearch-init.XXXXXX)"
+readonly TEMP_DIR
 readonly TEMPLATE_RESPONSE="${TEMP_DIR}/template-response.json"
 readonly MAPPINGS_RESPONSE="${TEMP_DIR}/mappings-response.json"
 
 cleanup() {
+  if [[ -z "${TEMP_DIR}" || "${TEMP_DIR}" == "/" || ! -d "${TEMP_DIR}" ]]; then
+    return
+  fi
   rm -rf -- "${TEMP_DIR}"
 }
 

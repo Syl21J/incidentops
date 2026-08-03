@@ -32,6 +32,9 @@ artifacts/investigations/
 *.swp
 .DS_Store
 
+# AI
+AGENTS.md
+
 # Personal project journal
 realisation.md
 REALISATION.md
