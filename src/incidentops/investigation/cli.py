@@ -9,6 +9,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from elasticsearch import Elasticsearch
 from incidentops.config import Settings
 from incidentops.investigation.graph import build_configured_investigation_graph
 from incidentops.investigation.model import (
@@ -28,6 +29,8 @@ from incidentops.investigation.report import (
     write_report_output,
 )
 from incidentops.investigation.tools import InvestigationToolset
+from incidentops.knowledge.embeddings import create_embedding_provider
+from incidentops.knowledge.retrieval import KnowledgeSearchService
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -105,14 +108,37 @@ def _run_investigation(args: argparse.Namespace) -> int:
         scripted_responses=scripted_responses,
     )
     toolset = InvestigationToolset.from_settings(settings)
-    print(
-        f"[INFO] Starting bounded investigation with {settings.llm_provider}",
-        file=sys.stderr,
-    )
+    knowledge_service: KnowledgeSearchService | None = None
     try:
-        graph = build_configured_investigation_graph(settings, model_provider, toolset)
+        if settings.knowledge_enabled:
+            knowledge_service = KnowledgeSearchService(
+                Elasticsearch(
+                    settings.elasticsearch_url,
+                    request_timeout=10,
+                    retry_on_timeout=True,
+                    max_retries=2,
+                ),
+                create_embedding_provider(
+                    settings.embedding_provider,
+                    settings.embedding_model,
+                    settings.embedding_device,
+                ),
+                owns_client=True,
+            )
+        print(
+            f"[INFO] Starting bounded investigation with {settings.llm_provider}",
+            file=sys.stderr,
+        )
+        graph = build_configured_investigation_graph(
+            settings,
+            model_provider,
+            toolset,
+            knowledge_retriever=knowledge_service,
+        )
         final_state = graph.invoke({"incident_request": request})
     finally:
+        if knowledge_service is not None:
+            knowledge_service.close()
         toolset.close()
 
     report = final_state.get("final_report")

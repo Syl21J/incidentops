@@ -5,7 +5,7 @@ IncidentOps implements a local order-processing path with logs and Prometheus me
 ```text
 Order producer -> Kafka -> Order consumer -> PostgreSQL
 
-Producer and consumer in WSL
+Producer and consumer
               |
               v
   logs/*.jsonl (one file per service)
@@ -17,9 +17,9 @@ Producer and consumer in WSL
  incidentops-logs-YYYY.MM.DD in Elasticsearch
               |
               v
- bounded Python search and aggregation tools in WSL
+ bounded Python search and aggregation tools
 
-Producer and consumer in WSL
+Producer and consumer
               |
               +-- HTTP :8001/metrics and :8002/metrics
               |
@@ -27,7 +27,7 @@ Producer and consumer in WSL
  Prometheus 3.12.0 in Docker Compose
               |
               v
- bounded typed metric tools in WSL
+ bounded typed metric tools
 ```
 
 The Python applications are not containerized. They expose metrics directly from WSL and
@@ -636,8 +636,140 @@ documents by `run_id`:
 ./scripts/check-agent-workflow.sh
 ```
 
-The first workflow is validated only for `slow_consumer_v1`. It has no runbook knowledge, RAG,
-multi-agent supervisor, remediation tools, hosted tracing, or automatic actions.
+The baseline workflow is validated only for `slow_consumer_v1`. Knowledge retrieval is disabled
+by default, and neither mode has a multi-agent supervisor, remediation tools, hosted tracing, or
+automatic actions.
+
+### Live-model RAG validation
+
+The deterministic scripts never consume an external model API. To validate the same bounded
+scenario with a real OpenAI-compatible model, first copy the local configuration and replace the
+model and credential placeholders:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+Set `LLM_MODEL` and `LLM_API_KEY` in `.env`. Leave `LLM_BASE_URL` blank for the provider default,
+or set it to the compatible endpoint you use. The selected model must support strict structured
+JSON-schema output. Do not commit `.env`; it is ignored by Git.
+
+Install the locked dependencies, validate Compose, start the project services, and run the live
+check:
+
+```bash
+uv sync --frozen
+docker compose config --quiet
+docker compose up -d
+./scripts/check-live-rag-workflow.sh
+```
+
+The script validates configuration without printing the API key, ingests the controlled corpus,
+runs `slow_consumer_v1` once, invokes the live model with hybrid RAG enabled and required, and
+evaluates the report outside LangGraph. It permits at most four model calls, ten read-only tool
+calls, two investigation attempts, and two retrievals. Generated reports, traces, and evaluation
+results remain under `artifacts/investigations/`; only the scenario-specific retained log documents
+are removed afterward. Stop the services without deleting their volumes when finished:
+
+```bash
+docker compose stop
+```
+
+## Controlled knowledge corpus and ingestion
+
+The repository contains 20 English operational documents under `knowledge/`, divided into
+architecture, runbooks, metrics, log events, and incident records. Every document has strict
+versioned YAML metadata and the same ordered operational sections. Validation rejects missing or
+unknown fields, unsupported enum values, duplicate document identifiers, misplaced document
+types, non-ASCII content, empty sections, and files outside the controlled category directories.
+
+Validate and deterministically chunk the corpus without contacting an external service:
+
+```bash
+uv run incidentops-knowledge validate --knowledge-directory knowledge
+```
+
+The Markdown-aware chunker preserves the heading hierarchy, caps chunks at 1,000 characters with
+a 120-character overlap, and generates stable identifiers from the document identifier, canonical
+heading path, and section-local chunk index. SHA-256 content and indexing hashes allow ingestion
+to distinguish created, updated, and unchanged chunks.
+
+The production provider uses `all-MiniLM-L6-v2` through sentence-transformers on CPU and requires
+384-dimensional batch embeddings. The `deterministic-test` provider must be selected explicitly;
+there is no automatic fallback. Both providers reject empty batches and invalid vector dimensions,
+and the production provider rejects inputs that would be silently truncated.
+
+Preview an ingestion plan without creating an index, embedding content, upserting, or deleting:
+
+```bash
+uv run incidentops-knowledge ingest --knowledge-directory knowledge --dry-run
+```
+
+Run ingestion and inspect the fixed index status:
+
+```bash
+uv run incidentops-knowledge ingest --knowledge-directory knowledge
+uv run incidentops-knowledge status
+```
+
+Ingestion creates `incidentops-knowledge-v1` idempotently with a strict mapping and a 384-dimension
+cosine `dense_vector`. The supplied directory is authoritative only after the complete corpus has
+validated. Changed chunks are embedded in batches and upserted first; only then are exact stale
+chunk IDs removed. Ingestion never deletes the complete index. Repeating an unchanged ingestion
+performs no embedding or document writes and reports all chunks as unchanged.
+
+Ingestion remains independent from retrieval and never invokes the investigation graph.
+
+## Bounded retrieval and optional RAG
+
+The knowledge CLI exposes lexical, vector, and hybrid retrieval without accepting Elasticsearch
+DSL. Lexical search uses fixed boosts for `title`, `headings`, and `content`; vector search embeds
+one bounded query with the same 384-dimensional provider contract as ingestion. Hybrid mode
+collects at most 100 candidates per branch and applies Python RRF with a fixed constant of 60,
+deduplication by chunk ID, and deterministic chunk-ID tie breaking.
+
+```bash
+uv run incidentops-knowledge search \
+  --query "increasing consumer lag and slow processing" \
+  --mode hybrid \
+  --service order-consumer
+```
+
+Only service, incident type, document type, and active-status filters are accepted. Results contain
+stable knowledge reference, document, and chunk IDs; bounded deterministic snippets; and separate
+lexical, vector, and fused scores. Backend queries and raw Elasticsearch responses are never
+exposed through the CLI or to the model.
+
+The graph builds its retrieval query only from categorical live metric and log summaries. It never
+copies incident prose, raw log messages, timelines, event IDs, or model-generated queries into the
+retrieval request. Retrieved snippets are marked as untrusted optional context. They cannot satisfy
+the deterministic live-evidence verifier, select tools, or replace the required Prometheus and
+Elasticsearch checks.
+
+Knowledge retrieval is disabled by default. When optional retrieval fails, the live diagnosis
+continues with an explicit limitation. When both `KNOWLEDGE_ENABLED` and `KNOWLEDGE_REQUIRED` are
+true, retrieval infrastructure failure produces a pipeline error. An empty valid result is not an
+infrastructure failure. The initial evidence collection and the single targeted recheck permit at
+most two retrieval calls in total.
+
+Run the ten-case document-level benchmark:
+
+```bash
+uv run incidentops-knowledge evaluate \
+  --cases evaluation/retrieval_cases.yaml \
+  --mode hybrid
+```
+
+The evaluation reports recall at K, precision at K, MRR, and explicitly excluded documents after
+deduplicating ranked chunks by document ID. Retrieval ground truth is consumed only by the
+evaluation command and is never passed to LangGraph. The complete live validation ingests the
+corpus, runs this benchmark, executes `slow_consumer_v1` once, and compares baseline and RAG graphs
+against exactly the same retained live evidence:
+
+```bash
+./scripts/check-rag-workflow.sh
+```
 
 ## Local endpoints
 
@@ -664,6 +796,15 @@ multi-agent supervisor, remediation tools, hosted tracing, or automatic actions.
 | `POSTGRES_PASSWORD` | local placeholder | PostgreSQL password |
 | `POSTGRES_DB` | `incidentops` | PostgreSQL database |
 | `ELASTICSEARCH_URL` | `http://localhost:9200` | WSL search-client endpoint |
+| `EMBEDDING_PROVIDER` | `sentence-transformers` | Explicit real or `deterministic-test` knowledge embedding provider |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | CPU sentence-transformers model; the v1 index requires 384 dimensions |
+| `EMBEDDING_DEVICE` | `cpu` | Fixed knowledge embedding device |
+| `KNOWLEDGE_ENABLED` | `false` | Enable bounded retrieval after live evidence collection |
+| `KNOWLEDGE_REQUIRED` | `false` | Treat retrieval infrastructure failure as a pipeline error |
+| `KNOWLEDGE_RETRIEVAL_MODE` | `hybrid` | Closed mode: `lexical`, `vector`, or `hybrid` |
+| `KNOWLEDGE_TOP_K` | `5` | Final reference count, bounded from 1 to 10 |
+| `KNOWLEDGE_CANDIDATE_K` | `40` | Per-mode candidates, bounded by `top_k` and 100 |
+| `KNOWLEDGE_RRF_K` | `60` | Fixed reciprocal-rank fusion constant |
 | `PROMETHEUS_URL` | `http://localhost:9090` | WSL typed metric-client endpoint |
 | `PROMETHEUS_PORT` | `9090` | Prometheus loopback host port |
 | `PROMETHEUS_SCRAPE_INTERVAL` | `2s` | Documented development scrape interval |
@@ -707,21 +848,21 @@ The workflow in `.github/workflows/ci.yml` executes these checks with Python 3.1
 locked dependencies on every push to `main` and every pull request. Elasticsearch-dependent
 integration coverage skips when Elasticsearch is unavailable in the CI runner. Run
 `./scripts/check-pipeline.sh`, `./scripts/check-log-pipeline.sh`,
-`./scripts/check-slow-consumer-scenario.sh`, and `./scripts/check-agent-workflow.sh` locally for
-real service validation. The agent workflow check uses the explicit scripted provider but real
-Prometheus and Elasticsearch tools, so it never requires a live model API key.
+`./scripts/check-slow-consumer-scenario.sh`, `./scripts/check-agent-workflow.sh`, and
+`./scripts/check-rag-workflow.sh` locally for real service validation. Those deterministic workflow
+checks use the explicit scripted provider but real Prometheus and Elasticsearch tools, so they
+never require a live model API key. Run `./scripts/check-live-rag-workflow.sh` separately when you
+explicitly want to spend live-model API calls.
 
 ## Next steps
 
-The current milestone stops after the first bounded LangGraph workflow for the single
-slow-consumer scenario. Potential future stages, each requiring an explicit implementation
-request, are:
+The current milestone stops after bounded optional RAG for the single slow-consumer workflow.
+Potential future stages, each requiring an explicit implementation request, are:
 
 1. Add Grafana only after an explicit implementation request.
 2. Define additional incident scenarios and service-level indicators separately.
-3. Add runbook retrieval and RAG only as a separately validated stage.
-4. Add a multi-agent supervisor only after independent agent roles are explicitly designed.
-5. Evaluate OpenTelemetry, MCP, Kubernetes, and application containerization separately
+3. Add a multi-agent supervisor only after independent agent roles are explicitly designed.
+4. Evaluate OpenTelemetry, MCP, Kubernetes, and application containerization separately
    rather than expanding the local MVP implicitly.
 
 ## License

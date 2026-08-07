@@ -90,6 +90,7 @@ def _actions_for_cause(
 def _sanitize_hypothesis(
     hypothesis: RootCauseHypothesis,
     existing_evidence_ids: set[str],
+    existing_knowledge_ids: set[str],
     *,
     verified: bool,
 ) -> RootCauseHypothesis | None:
@@ -114,6 +115,11 @@ def _sanitize_hypothesis(
         update={
             "supporting_evidence_ids": supporting,
             "contradicting_evidence_ids": contradicting,
+            "knowledge_reference_ids": [
+                reference_id
+                for reference_id in hypothesis.knowledge_reference_ids
+                if reference_id in existing_knowledge_ids
+            ],
             "reasoning_summary": reasoning_summary,
         }
     )
@@ -138,8 +144,15 @@ def assemble_incident_report(
             *state.get("negative_evidence", []),
         ]
     }
+    knowledge_references = list(state.get("knowledge_references", []))[:10]
+    existing_knowledge_ids = {item.knowledge_reference_id for item in knowledge_references}
     primary = (
-        _sanitize_hypothesis(hypotheses[0], existing_evidence_ids, verified=True)
+        _sanitize_hypothesis(
+            hypotheses[0],
+            existing_evidence_ids,
+            existing_knowledge_ids,
+            verified=True,
+        )
         if status == IncidentStatus.DIAGNOSED and hypotheses
         else None
     )
@@ -151,6 +164,7 @@ def assemble_incident_report(
             sanitized := _sanitize_hypothesis(
                 hypothesis,
                 existing_evidence_ids,
+                existing_knowledge_ids,
                 verified=False,
             )
         )
@@ -181,7 +195,7 @@ def assemble_incident_report(
     )
     actions = _actions_for_cause(cause_code, action_evidence_ids)
 
-    limitations = list(state.get("errors", []))
+    limitations = [*state.get("errors", []), *state.get("knowledge_errors", [])]
     unavailable = [
         item.evidence_id
         for item in [
@@ -212,10 +226,12 @@ def assemble_incident_report(
         alternative_hypotheses=alternatives,
         supporting_evidence=positive_evidence,
         negative_evidence=negative_evidence,
+        knowledge_references=knowledge_references,
         recommended_actions=actions,
         limitations=limitations,
         tool_call_count=state.get("tool_call_count", 0),
         model_call_count=state.get("model_call_count", 0),
+        knowledge_retrieval_count=state.get("knowledge_retrieval_count", 0),
         investigation_attempts=state.get("investigation_attempts", 1),
         started_at=state.get("workflow_started_at", completed),
         completed_at=completed,
@@ -237,6 +253,7 @@ def render_report_markdown(report: IncidentReport) -> str:
         f"- Root cause: `{root_cause}`",
         f"- Tool calls: {report.tool_call_count}",
         f"- Model calls: {report.model_call_count}",
+        f"- Knowledge retrievals: {report.knowledge_retrieval_count}",
         f"- Investigation attempts: {report.investigation_attempts}",
         "",
         "## Summary",
@@ -258,6 +275,15 @@ def render_report_markdown(report: IncidentReport) -> str:
             lines.append(f"- `{item.evidence_id}`: {item.observation}")
     else:
         lines.append("- No negative evidence was available.")
+    lines.extend(["", "## Knowledge references", ""])
+    if report.knowledge_references:
+        for item in report.knowledge_references:
+            lines.append(
+                f"- `{item.knowledge_reference_id}`: {item.title} "
+                f"(`{item.document_id}`, `{item.chunk_id}`)"
+            )
+    else:
+        lines.append("- No knowledge context was retrieved.")
     lines.extend(["", "## Recommended actions", ""])
     for action in report.recommended_actions:
         lines.append(f"- `{action.action_code.value}`: {action.reason}")

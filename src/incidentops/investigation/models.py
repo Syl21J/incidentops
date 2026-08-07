@@ -18,6 +18,8 @@ from pydantic import (
     model_validator,
 )
 
+from incidentops.knowledge.models import KnowledgeReference
+
 MAX_TIME_RANGE = timedelta(hours=6)
 MAX_HYPOTHESES = 3
 MAX_TOOL_CALLS = 10
@@ -36,6 +38,10 @@ Identifier = Annotated[
 EvidenceIdentifier = Annotated[
     str,
     StringConstraints(pattern=r"^(metric|log|negative)-[a-z0-9]+(?:-[a-z0-9]+)*$"),
+]
+KnowledgeReferenceIdentifier = Annotated[
+    str,
+    StringConstraints(pattern=r"^knowledge-[a-f0-9]{24}$"),
 ]
 RawValue = str | int | float | bool | None
 
@@ -358,6 +364,10 @@ class RootCauseHypothesis(StrictModel):
     confidence: float = Field(ge=0.0, le=1.0)
     supporting_evidence_ids: list[EvidenceIdentifier] = Field(default_factory=list)
     contradicting_evidence_ids: list[EvidenceIdentifier] = Field(default_factory=list)
+    knowledge_reference_ids: list[KnowledgeReferenceIdentifier] = Field(
+        default_factory=list,
+        max_length=10,
+    )
     reasoning_summary: ShortText
 
     @field_validator("reasoning_summary")
@@ -383,6 +393,8 @@ class RootCauseHypothesis(StrictModel):
             raise ValueError("contradicting evidence identifiers must be unique")
         if supporting & contradicting:
             raise ValueError("evidence cannot both support and contradict one hypothesis")
+        if len(self.knowledge_reference_ids) != len(set(self.knowledge_reference_ids)):
+            raise ValueError("knowledge reference identifiers must be unique")
         return self
 
 
@@ -432,10 +444,12 @@ class IncidentReport(StrictModel):
     )
     supporting_evidence: list[PositiveEvidence] = Field(default_factory=list)
     negative_evidence: list[NegativeEvidence] = Field(default_factory=list)
+    knowledge_references: list[KnowledgeReference] = Field(default_factory=list, max_length=10)
     recommended_actions: list[RecommendedAction] = Field(default_factory=list, max_length=6)
     limitations: list[ShortText] = Field(default_factory=list, max_length=20)
     tool_call_count: int = Field(ge=0, le=10)
     model_call_count: int = Field(default=0, ge=0, le=MAX_MODEL_CALLS)
+    knowledge_retrieval_count: int = Field(default=0, ge=0, le=2)
     investigation_attempts: int = Field(ge=1, le=2)
     started_at: AwareDatetime
     completed_at: AwareDatetime
@@ -487,6 +501,8 @@ class EvaluationResult(StrictModel):
     expected_log_evidence_recall: float = Field(ge=0.0, le=1.0)
     negative_evidence_recall: float = Field(ge=0.0, le=1.0)
     unsupported_evidence_reference_count: int = Field(ge=0)
+    unsupported_knowledge_reference_count: int = Field(default=0, ge=0)
+    knowledge_reference_count: int = Field(default=0, ge=0, le=10)
     forbidden_action_count: int = Field(ge=0)
     tool_call_count: int = Field(ge=0, le=10)
     investigation_attempt_count: int = Field(ge=1, le=2)

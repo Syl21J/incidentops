@@ -26,6 +26,14 @@ def test_default_application_endpoints_use_localhost(
     assert settings.consumer_metrics_port == 8002
     assert settings.consumer_processing_delay_ms == 0
     assert settings.llm_provider == "openai-compatible"
+    assert settings.embedding_provider == "sentence-transformers"
+    assert settings.embedding_model == "all-MiniLM-L6-v2"
+    assert settings.embedding_device == "cpu"
+    assert settings.knowledge_enabled is False
+    assert settings.knowledge_required is False
+    assert settings.knowledge_retrieval_mode == "hybrid"
+    assert settings.knowledge_top_k == 5
+    assert settings.knowledge_candidate_k == 40
     assert settings.llm_temperature == 0
     assert settings.investigation_max_tool_calls == 10
 
@@ -41,6 +49,7 @@ def test_environment_overrides_configuration(
     monkeypatch.setenv("LOG_FILE_ENABLED", "false")
     monkeypatch.setenv("LOG_DIRECTORY", "temporary-logs")
     monkeypatch.setenv("RUN_ID", "config-test")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "deterministic-test")
 
     settings = Settings()
 
@@ -50,6 +59,7 @@ def test_environment_overrides_configuration(
     assert settings.log_file_enabled is False
     assert settings.log_directory == Path("temporary-logs")
     assert settings.run_id == "config-test"
+    assert settings.embedding_provider == "deterministic-test"
 
 
 def test_processing_delay_configuration_is_bounded(
@@ -71,4 +81,21 @@ def test_kafka_offset_reset_policy_is_closed(
     monkeypatch.setenv("KAFKA_AUTO_OFFSET_RESET", "invalid")
 
     with pytest.raises(ValueError, match="earliest"):
+        Settings()
+
+
+def test_knowledge_configuration_is_explicit_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KNOWLEDGE_REQUIRED", "true")
+    monkeypatch.setenv("KNOWLEDGE_ENABLED", "false")
+    with pytest.raises(ValueError, match="KNOWLEDGE_REQUIRED"):
+        Settings()
+
+    monkeypatch.setenv("KNOWLEDGE_REQUIRED", "false")
+    monkeypatch.setenv("KNOWLEDGE_TOP_K", "6")
+    monkeypatch.setenv("KNOWLEDGE_CANDIDATE_K", "5")
+    with pytest.raises(ValueError, match="KNOWLEDGE_CANDIDATE_K"):
         Settings()

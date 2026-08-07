@@ -2,9 +2,9 @@
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +38,19 @@ class Settings(BaseSettings):
     elasticsearch_url: str = "http://localhost:9200"
     prometheus_url: str = "http://localhost:9090"
     order_random_seed: int = 42
+
+    embedding_provider: Literal["sentence-transformers", "deterministic-test"] = (
+        "sentence-transformers"
+    )
+    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_device: Literal["cpu"] = "cpu"
+
+    knowledge_enabled: bool = False
+    knowledge_required: bool = False
+    knowledge_retrieval_mode: Literal["lexical", "vector", "hybrid"] = "hybrid"
+    knowledge_top_k: int = Field(default=5, ge=1, le=10)
+    knowledge_candidate_k: int = Field(default=40, ge=1, le=100)
+    knowledge_rrf_k: Literal[60] = 60
 
     metrics_enabled: bool = True
     metrics_host: str = "0.0.0.0"
@@ -79,6 +92,7 @@ class Settings(BaseSettings):
         "run_id",
         "elasticsearch_url",
         "prometheus_url",
+        "embedding_model",
         "metrics_host",
     )
     @classmethod
@@ -89,6 +103,16 @@ class Settings(BaseSettings):
         if not normalized:
             raise ValueError("configuration value must not be blank")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_knowledge_configuration(self) -> Self:
+        """Keep optional retrieval explicit and every candidate bound coherent."""
+
+        if self.knowledge_required and not self.knowledge_enabled:
+            raise ValueError("KNOWLEDGE_REQUIRED requires KNOWLEDGE_ENABLED=true")
+        if self.knowledge_candidate_k < self.knowledge_top_k:
+            raise ValueError("KNOWLEDGE_CANDIDATE_K must be at least KNOWLEDGE_TOP_K")
+        return self
 
 
 @lru_cache(maxsize=1)

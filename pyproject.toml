@@ -15,6 +15,8 @@ dependencies = [
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.11,<3",
     "pyyaml>=6.0,<7",
+    "sentence-transformers>=5.1,<6",
+    "torch>=2.7,<3",
 ]
 
 [project.scripts]
@@ -22,6 +24,7 @@ incidentops-producer = "incidentops.producer:main"
 incidentops-consumer = "incidentops.consumer:main"
 incidentops-log-search = "incidentops.log_search:main"
 incidentops-metric-query = "incidentops.metric_query:main"
+incidentops-knowledge = "incidentops.knowledge.cli:main"
 
 [dependency-groups]
 dev = [
@@ -54,3 +57,11 @@ pythonVersion = "3.12"
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -87,6 +87,17 @@ def _unsupported_reference_count(report: IncidentReport) -> int:
     return sum(reference not in known_ids for reference in references)
 
 
+def _unsupported_knowledge_reference_count(report: IncidentReport) -> int:
+    known_ids = {item.knowledge_reference_id for item in report.knowledge_references}
+    references = [
+        reference_id
+        for hypothesis in [report.primary_root_cause, *report.alternative_hypotheses]
+        if hypothesis is not None
+        for reference_id in hypothesis.knowledge_reference_ids
+    ]
+    return sum(reference not in known_ids for reference in references)
+
+
 def evaluate_incident_report(
     report: IncidentReport,
     manifest: ScenarioManifest,
@@ -139,6 +150,8 @@ def evaluate_incident_report(
             len(manifest.negative_evidence),
         ),
         unsupported_evidence_reference_count=_unsupported_reference_count(report),
+        unsupported_knowledge_reference_count=_unsupported_knowledge_reference_count(report),
+        knowledge_reference_count=len(report.knowledge_references),
         forbidden_action_count=sum(action in action_codes for action in manifest.forbidden_actions),
         tool_call_count=report.tool_call_count,
         investigation_attempt_count=report.investigation_attempts,

@@ -19,6 +19,7 @@ from incidentops.investigation.models import (
     ServiceName,
     VerificationResult,
 )
+from incidentops.knowledge.models import KnowledgeReference
 
 
 def merge_completed_tasks(
@@ -148,6 +149,8 @@ class InvestigationState(TypedDict, total=False):
     metric_evidence: Annotated[list[MetricEvidence], merge_metric_evidence]
     log_evidence: Annotated[list[LogEvidence], merge_log_evidence]
     negative_evidence: Annotated[list[NegativeEvidence], merge_negative_evidence]
+    knowledge_references: list[KnowledgeReference]
+    knowledge_errors: Annotated[list[str], merge_errors]
 
     hypotheses: list[RootCauseHypothesis]
     verification_result: VerificationResult
@@ -156,6 +159,7 @@ class InvestigationState(TypedDict, total=False):
 
     tool_call_count: Annotated[int, add_counts]
     model_call_count: Annotated[int, add_counts]
+    knowledge_retrieval_count: Annotated[int, add_counts]
     investigation_attempts: Annotated[int, maximum_count]
     recheck_requested: Annotated[bool, merge_boolean]
     errors: Annotated[list[str], merge_errors]

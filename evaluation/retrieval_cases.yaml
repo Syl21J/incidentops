@@ -1,0 +1,121 @@
+schema_version: 1
+cases:
+  - case_id: retrieval_slow_consumer
+    query: increasing consumer lag slow processing latency no database or Kafka errors
+    filters:
+      services: [order-consumer]
+      statuses: [active]
+    relevant_document_ids:
+      - incident_slow_consumer_processing
+      - runbook_slow_processing
+      - runbook_consumer_lag_triage
+    excluded_document_ids: [incident_kafka_broker_interruption]
+    top_k: 5
+
+  - case_id: retrieval_consumer_lag
+    query: Kafka consumer lag grows while consumer throughput is lower than producer rate
+    filters:
+      services: [order-consumer]
+      incident_types: [consumer_lag]
+      statuses: [active]
+    relevant_document_ids:
+      - metric_consumer_lag
+      - runbook_consumer_lag_triage
+      - architecture_order_processing_flow
+    excluded_document_ids: [runbook_log_pipeline]
+    top_k: 5
+
+  - case_id: retrieval_database_latency
+    query: database latency slows order processing and increases consumer backlog
+    filters:
+      services: [postgres]
+      incident_types: [database_latency]
+      statuses: [active]
+    relevant_document_ids:
+      - incident_database_latency_backlog
+      - runbook_database_connectivity
+      - log_event_database_errors
+    excluded_document_ids: [incident_kafka_broker_interruption]
+    top_k: 5
+
+  - case_id: retrieval_traffic_spike
+    query: producer traffic spike exceeds stable consumer capacity
+    filters:
+      services: [order-producer]
+      incident_types: [traffic_spike]
+      statuses: [active]
+    relevant_document_ids:
+      - incident_traffic_spike_backlog
+      - metric_producer_consumer_rates
+      - runbook_consumer_lag_triage
+    excluded_document_ids: [incident_database_latency_backlog]
+    top_k: 5
+
+  - case_id: retrieval_kafka_failure
+    query: Kafka broker connectivity errors interrupt producer and consumer throughput
+    filters:
+      services: [kafka]
+      incident_types: [kafka_broker_failure]
+      statuses: [active]
+    relevant_document_ids:
+      - incident_kafka_broker_interruption
+      - runbook_kafka_broker_health
+      - log_event_kafka_errors
+    excluded_document_ids: [incident_traffic_spike_backlog]
+    top_k: 5
+
+  - case_id: retrieval_log_pipeline
+    query: JSON logs exist but Filebeat does not deliver events to Elasticsearch
+    filters:
+      services: [filebeat]
+      incident_types: [log_pipeline_failure]
+      statuses: [active]
+    relevant_document_ids:
+      - runbook_log_pipeline
+      - architecture_observability_pipeline
+    excluded_document_ids: [runbook_database_connectivity]
+    top_k: 4
+
+  - case_id: retrieval_metrics_unavailable
+    query: Prometheus target unavailable and metric samples are missing
+    filters:
+      services: [prometheus]
+      incident_types: [metrics_unavailable]
+      statuses: [active]
+    relevant_document_ids:
+      - architecture_observability_pipeline
+    excluded_document_ids: [runbook_log_pipeline]
+    top_k: 3
+
+  - case_id: retrieval_malformed_event
+    query: consumer rejects malformed order events with invalid payload fields
+    filters:
+      services: [order-consumer]
+      incident_types: [malformed_event]
+      statuses: [active]
+    relevant_document_ids:
+      - runbook_malformed_order_events
+    excluded_document_ids: [runbook_consumer_rebalance]
+    top_k: 3
+
+  - case_id: retrieval_consumer_rebalance
+    query: consumer group rebalance pauses partition processing and lag rises temporarily
+    filters:
+      services: [order-consumer]
+      incident_types: [consumer_rebalance]
+      statuses: [active]
+    relevant_document_ids:
+      - runbook_consumer_rebalance
+    excluded_document_ids: [incident_traffic_spike_backlog]
+    top_k: 3
+
+  - case_id: retrieval_duplicate_processing
+    query: replayed order events must remain idempotent in PostgreSQL
+    filters:
+      services: [order-consumer]
+      incident_types: [duplicate_processing]
+      statuses: [active]
+    relevant_document_ids:
+      - architecture_order_processing_flow
+    excluded_document_ids: [runbook_log_pipeline]
+    top_k: 3
