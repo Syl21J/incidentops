@@ -2,8 +2,9 @@
 
 # Purpose: deterministic end-to-end RAG validation with the scripted-test model.
 # This script uses real infrastructure, metrics, logs, embeddings, and retrieval, but it never
-# contacts an external LLM endpoint and does not require an API key. Use it for repeatable local
-# validation and regression testing.
+# contacts an external LLM endpoint and does not require an API key.
+# Run when: the corpus, chunking, embeddings, ingestion, retrieval, RAG integration, or retrieval
+# evaluation changes. The initialized Compose services must already be running.
 
 set -Eeuo pipefail
 
@@ -36,14 +37,9 @@ cleanup() {
   local recovered_run_id=""
   trap - EXIT
   if [[ -z "${scenario_run_id}" && -f "${METADATA_FILE}" ]]; then
-    if recovered_run_id="$(uv run python - "${METADATA_FILE}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["run_id"])
-PY
-)"; then
+    if recovered_run_id="$(
+      uv run python -m incidentops.validation.cli metadata-run-id "${METADATA_FILE}"
+    )"; then
       scenario_run_id="${recovered_run_id}"
     else
       error "Could not recover the retained scenario run identifier."
@@ -52,24 +48,7 @@ PY
   fi
   if [[ -n "${scenario_run_id}" ]]; then
     log "Deleting only retained log documents for run_id ${scenario_run_id}"
-    if ! RUN_ID_TO_DELETE="${scenario_run_id}" uv run python - <<'PY'
-import os
-
-from elasticsearch import Elasticsearch
-
-client = Elasticsearch("http://localhost:9200", request_timeout=10)
-try:
-    client.delete_by_query(
-        index="incidentops-logs-*",
-        query={"term": {"run_id": os.environ["RUN_ID_TO_DELETE"]}},
-        allow_no_indices=True,
-        conflicts="proceed",
-        ignore_unavailable=True,
-        refresh=True,
-    )
-finally:
-    client.close()
-PY
+    if ! uv run python -m incidentops.validation.cli delete-run-logs "${scenario_run_id}"
     then
       error "Could not remove the retained run-scoped log documents."
       exit_status=1
@@ -96,18 +75,8 @@ EMBEDDING_PROVIDER=sentence-transformers \
     --cases evaluation/retrieval_cases.yaml \
     --mode hybrid >"${RETRIEVAL_EVALUATION}"
 
-uv run python - "${RETRIEVAL_EVALUATION}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-assert result["case_count"] == 10
-assert result["recall_at_k"] >= 0.8
-assert result["precision_at_k"] >= 0.3
-assert result["mrr"] >= 0.8
-assert result["excluded_document_count"] == 0
-PY
+uv run python -m incidentops.validation.cli \
+  validate-retrieval-benchmark "${RETRIEVAL_EVALUATION}"
 success "Hybrid retrieval benchmark passed"
 
 log "Running slow_consumer_v1 once and retaining only its bounded log window"
@@ -116,14 +85,7 @@ log "Running slow_consumer_v1 once and retaining only its bounded log window"
   --output-metadata "${METADATA_FILE}"
 
 read -r scenario_run_id scenario_start scenario_end < <(
-  uv run python - "${METADATA_FILE}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(metadata["run_id"], metadata["start_time"], metadata["end_time"])
-PY
+  uv run python -m incidentops.validation.cli scenario-window "${METADATA_FILE}"
 )
 
 if [[ -z "${scenario_run_id}" || -z "${scenario_start}" || -z "${scenario_end}" ]]; then
@@ -143,12 +105,14 @@ common_arguments=(
 )
 
 log "Running the baseline graph against the retained live evidence"
+# Keep the baseline independent from any knowledge settings in the developer's .env file.
 KNOWLEDGE_ENABLED=false \
   uv run python -m incidentops.investigation.cli \
     "${common_arguments[@]}" \
     --output-file "${BASELINE_REPORT}"
 
 log "Running the RAG graph against exactly the same retained live evidence"
+# Pin the retrieval contract so this acceptance check cannot silently degrade or change mode.
 KNOWLEDGE_ENABLED=true \
 KNOWLEDGE_REQUIRED=true \
 KNOWLEDGE_RETRIEVAL_MODE=hybrid \
@@ -166,40 +130,8 @@ uv run python -m incidentops.evaluation.cli \
   --scenario scenarios/slow_consumer.yaml \
   --output-file "${RAG_EVALUATION}"
 
-uv run python - \
-  "${BASELINE_REPORT}" \
-  "${RAG_REPORT}" \
-  "${BASELINE_EVALUATION}" \
-  "${RAG_EVALUATION}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-baseline = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-rag = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-baseline_evaluation = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
-rag_evaluation = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
-
-assert baseline["status"] == "diagnosed"
-assert rag["status"] == "diagnosed"
-assert baseline["primary_root_cause"]["cause_code"] == "slow_consumer_processing"
-assert rag["primary_root_cause"]["cause_code"] == "slow_consumer_processing"
-assert baseline["tool_call_count"] == rag["tool_call_count"] == 6
-assert baseline["supporting_evidence"] == rag["supporting_evidence"]
-assert baseline["negative_evidence"] == rag["negative_evidence"]
-assert baseline["knowledge_references"] == []
-assert baseline["knowledge_retrieval_count"] == 0
-assert len(rag["knowledge_references"]) > 0
-assert rag["knowledge_retrieval_count"] == 1
-assert baseline_evaluation["root_cause_exact_match"] is True
-assert rag_evaluation["root_cause_exact_match"] is True
-assert baseline_evaluation["forbidden_action_count"] == 0
-assert rag_evaluation["forbidden_action_count"] == 0
-assert rag_evaluation["unsupported_knowledge_reference_count"] == 0
-
-print("\nIncidentOps RAG workflow validation succeeded.")
-print(f'Baseline root cause: {baseline["primary_root_cause"]["cause_code"]}')
-print(f'RAG root cause: {rag["primary_root_cause"]["cause_code"]}')
-print(f'Live tool calls in both runs: {rag["tool_call_count"]}')
-print(f'Validated knowledge references: {len(rag["knowledge_references"])}')
-PY
+uv run python -m incidentops.validation.cli validate-rag-workflow \
+  --baseline-report "${BASELINE_REPORT}" \
+  --rag-report "${RAG_REPORT}" \
+  --baseline-evaluation "${BASELINE_EVALUATION}" \
+  --rag-evaluation "${RAG_EVALUATION}"

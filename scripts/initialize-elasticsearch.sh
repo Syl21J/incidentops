@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+# Purpose: install and verify the versioned Elasticsearch log index template without deleting an
+# existing index.
+# Run when: setting up a new environment or after the log template or mapped fields change. The
+# project Elasticsearch service must already be running and healthy.
+
 set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,48 +81,10 @@ curl \
   "${ELASTICSEARCH_URL}/incidentops-logs-*/_mapping?allow_no_indices=true" \
   >"${MAPPINGS_RESPONSE}"
 
-python3 - \
-  "${TEMPLATE_FILE}" \
-  "${TEMPLATE_RESPONSE}" \
-  "${MAPPINGS_RESPONSE}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-template_file, template_response_file, mappings_response_file = map(Path, sys.argv[1:])
-expected_template = json.loads(template_file.read_text(encoding="utf-8"))
-template_response = json.loads(template_response_file.read_text(encoding="utf-8"))
-index_mappings = json.loads(mappings_response_file.read_text(encoding="utf-8"))
-
-expected_properties = expected_template["template"]["mappings"]["properties"]
-installed_properties = template_response["index_templates"][0]["index_template"]["template"][
-    "mappings"
-]["properties"]
-
-expected_types = {
-    field: definition["type"] for field, definition in expected_properties.items()
-}
-installed_types = {
-    field: definition["type"] for field, definition in installed_properties.items()
-}
-if installed_types != expected_types:
-    raise SystemExit("The installed index template mapping does not match the versioned mapping.")
-
-for index_name, index_definition in index_mappings.items():
-    properties = index_definition["mappings"].get("properties", {})
-    actual_types = {
-        field: properties.get(field, {}).get("type") for field in expected_types
-    }
-    mismatches = {
-        field: (expected_type, actual_types[field])
-        for field, expected_type in expected_types.items()
-        if actual_types[field] != expected_type
-    }
-    if mismatches:
-        raise SystemExit(
-            f"Existing index {index_name} has an incompatible mapping: {mismatches}"
-        )
-PY
+uv run python -m incidentops.validation.cli validate-elasticsearch-mappings \
+  --template "${TEMPLATE_FILE}" \
+  --installed-template "${TEMPLATE_RESPONSE}" \
+  --index-mappings "${MAPPINGS_RESPONSE}"
 
 success "The template and existing IncidentOps log mappings are compatible"
 printf '\nIncidentOps Elasticsearch initialization succeeded.\n'

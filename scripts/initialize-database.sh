@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# Purpose: apply the versioned PostgreSQL schema migration idempotently to the project database.
+# Run when: setting up a new environment or after the tracked SQL migration changes. The project
+# PostgreSQL service must already be running and healthy.
+
 set -Eeuo pipefail
 
 # Resolve paths so the migration works from any current directory.

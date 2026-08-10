@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# Purpose: verify the health and basic behavior of the existing IncidentOps Compose services.
+# Run when: services are started, or after Compose, networking, ports, health checks, or service
+# configuration changes. This script checks the stack but does not start it.
+
 set -Eeuo pipefail
 
 # Resolve the repository independently from the caller's current directory.
@@ -48,7 +52,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 if ! docker info >/dev/null 2>&1; then
-  error "Docker is unavailable. Check Docker Desktop and WSL integration."
+  error "Docker is unavailable. Check the local Docker installation."
   exit 1
 fi
 success "Docker is available"
@@ -144,7 +148,7 @@ if ! curl --fail --silent --show-error "http://${prometheus_binding}/-/healthy" 
 fi
 success "Prometheus answers on http://${prometheus_binding}/-/healthy"
 
-# A TCP connection from WSL verifies the externally published Kafka listener.
+# A host TCP connection verifies the externally published Kafka listener.
 kafka_binding="$(docker compose port kafka 9092 | tail -n 1)"
 if [[ -z "${kafka_binding}" ]]; then
   error "Could not resolve the Kafka host port."
@@ -153,10 +157,10 @@ fi
 kafka_host="${kafka_binding%:*}"
 kafka_port="${kafka_binding##*:}"
 if ! timeout 5 bash -c "exec 3<>/dev/tcp/${kafka_host}/${kafka_port}"; then
-  error "Kafka is not reachable from WSL on ${kafka_binding}."
+  error "Kafka is not reachable from the host on ${kafka_binding}."
   exit 1
 fi
-success "Kafka is reachable from WSL on ${kafka_binding}"
+success "Kafka is reachable from the host on ${kafka_binding}"
 
 # Create and describe a unique topic to prove that the broker handles requests.
 test_topic="incidentops-infra-check-$(date +%s)-$$"

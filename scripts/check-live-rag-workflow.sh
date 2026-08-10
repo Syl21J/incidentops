@@ -3,7 +3,8 @@
 # Purpose: end-to-end RAG validation with the configured live OpenAI-compatible model.
 # This script uses real infrastructure and may make up to four billable model calls. It requires
 # valid LLM_MODEL and LLM_API_KEY settings, and the model must support strict structured output.
-# Use it only when explicitly validating real-model behavior after the deterministic check passes.
+# Run when: explicitly validating prompts, model configuration, or real-model behavior after the
+# deterministic agent and RAG checks pass. The initialized Compose services must already be running.
 
 set -Eeuo pipefail
 
@@ -35,14 +36,9 @@ cleanup() {
 
   trap - EXIT
   if [[ -z "${scenario_run_id}" && -f "${METADATA_FILE}" ]]; then
-    if recovered_run_id="$(uv run python - "${METADATA_FILE}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["run_id"])
-PY
-)"; then
+    if recovered_run_id="$(
+      uv run python -m incidentops.validation.cli metadata-run-id "${METADATA_FILE}"
+    )"; then
       scenario_run_id="${recovered_run_id}"
     else
       error "Could not recover the retained scenario run identifier."
@@ -52,26 +48,7 @@ PY
 
   if [[ -n "${scenario_run_id}" ]]; then
     log "Deleting only retained log documents for run_id ${scenario_run_id}"
-    if ! RUN_ID_TO_DELETE="${scenario_run_id}" uv run python - <<'PY'
-import os
-
-from elasticsearch import Elasticsearch
-
-from incidentops.config import Settings
-
-client = Elasticsearch(Settings().elasticsearch_url, request_timeout=10)
-try:
-    client.delete_by_query(
-        index="incidentops-logs-*",
-        query={"term": {"run_id": os.environ["RUN_ID_TO_DELETE"]}},
-        allow_no_indices=True,
-        conflicts="proceed",
-        ignore_unavailable=True,
-        refresh=True,
-    )
-finally:
-    client.close()
-PY
+    if ! uv run python -m incidentops.validation.cli delete-run-logs "${scenario_run_id}"
     then
       error "Could not remove the retained run-scoped log documents."
       cleanup_failed=true
@@ -94,22 +71,8 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 log "Validating the live model configuration without exposing credentials"
-LLM_PROVIDER=openai-compatible uv run python - <<'PY'
-import sys
-
-from pydantic import ValidationError
-
-from incidentops.config import Settings
-from incidentops.investigation.model import ModelConfigurationError, OpenAICompatibleModelProvider
-
-try:
-    settings = Settings(llm_provider="openai-compatible")
-    OpenAICompatibleModelProvider(settings)
-except (ModelConfigurationError, ValidationError) as error:
-    print(f"[ERROR] {error}", file=sys.stderr)
-    raise SystemExit(2) from error
-print(f"[OK]   Live model configuration is valid for model={settings.llm_model}")
-PY
+LLM_PROVIDER=openai-compatible \
+  uv run python -m incidentops.validation.cli validate-live-model
 
 log "Validating Compose and required infrastructure"
 docker compose config --quiet
@@ -125,14 +88,7 @@ log "Running slow_consumer_v1 once and retaining its bounded log window"
   --output-metadata "${METADATA_FILE}"
 
 read -r scenario_run_id scenario_start scenario_end < <(
-  uv run python - "${METADATA_FILE}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(metadata["run_id"], metadata["start_time"], metadata["end_time"])
-PY
+  uv run python -m incidentops.validation.cli scenario-window "${METADATA_FILE}"
 )
 
 if [[ -z "${scenario_run_id}" || -z "${scenario_start}" || -z "${scenario_end}" ]]; then
@@ -141,13 +97,11 @@ if [[ -z "${scenario_run_id}" || -z "${scenario_start}" || -z "${scenario_end}" 
 fi
 success "Captured exact scenario window ${scenario_start} to ${scenario_end}"
 
-artifact_directory="$(uv run python -c '
-from incidentops.config import Settings
-print(Settings().investigation_artifact_directory)
-')"
+artifact_directory="$(uv run python -m incidentops.validation.cli artifact-directory)"
 evaluation_file="${artifact_directory}/${scenario_run_id}.live-rag.evaluation.json"
 
 log "Executing LangGraph with the live model and required hybrid retrieval"
+# Pin the retrieval contract so a live acceptance run fails instead of silently losing RAG.
 LLM_PROVIDER=openai-compatible \
 KNOWLEDGE_ENABLED=true \
 KNOWLEDGE_REQUIRED=true \
@@ -171,46 +125,7 @@ uv run python -m incidentops.evaluation.cli \
   --scenario scenarios/slow_consumer.yaml \
   --output-file "${evaluation_file}"
 
-uv run python - \
-  "${REPORT_FILE}" \
-  "${evaluation_file}" \
-  "${artifact_directory}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-evaluation = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-artifact_directory = Path(sys.argv[3])
-
-assert report["status"] == "diagnosed"
-assert report["primary_root_cause"]["cause_code"] == "slow_consumer_processing"
-assert report["knowledge_retrieval_count"] in {1, 2}
-assert len(report["knowledge_references"]) > 0
-assert evaluation["root_cause_exact_match"] is True
-assert evaluation["root_cause_rank"] == 1
-assert evaluation["expected_metric_evidence_recall"] == 1.0
-assert evaluation["expected_log_evidence_recall"] == 1.0
-assert evaluation["negative_evidence_recall"] == 1.0
-assert evaluation["unsupported_evidence_reference_count"] == 0
-assert evaluation["unsupported_knowledge_reference_count"] == 0
-assert evaluation["forbidden_action_count"] == 0
-assert evaluation["tool_call_count"] <= 10
-assert evaluation["investigation_attempt_count"] <= 2
-assert report["model_call_count"] <= 4
-
-report_artifact = artifact_directory / f'{report["investigation_id"]}.report.json'
-trace_artifact = artifact_directory / f'{report["investigation_id"]}.trace.jsonl'
-assert report_artifact.is_file()
-assert trace_artifact.is_file()
-
-print("\nIncidentOps live-model RAG validation succeeded.")
-print(f'Root cause: {report["primary_root_cause"]["cause_code"]}')
-print(f'Model calls: {report["model_call_count"]}/4')
-print(f'Tool calls: {report["tool_call_count"]}/10')
-print(f'Investigation attempts: {report["investigation_attempts"]}/2')
-print(f'Knowledge references: {len(report["knowledge_references"])}')
-print(f'Persisted report: {report_artifact}')
-print(f'Persisted trace: {trace_artifact}')
-print(f'Persisted evaluation: {Path(sys.argv[2])}')
-PY
+uv run python -m incidentops.validation.cli validate-live-rag-workflow \
+  --report "${REPORT_FILE}" \
+  --evaluation "${evaluation_file}" \
+  --artifact-directory "${artifact_directory}"

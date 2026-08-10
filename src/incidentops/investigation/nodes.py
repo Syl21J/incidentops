@@ -30,11 +30,11 @@ from incidentops.investigation.models import (
     TraceStatus,
     VerificationDecision,
 )
+from incidentops.investigation.policy import InvestigationPolicy
 from incidentops.investigation.report import assemble_incident_report
 from incidentops.investigation.state import InvestigationState
 from incidentops.investigation.tools import InvestigationToolInput, InvestigationToolset
 from incidentops.investigation.verifier import verify_investigation_state
-from incidentops.knowledge.models import RetrievalMode
 from incidentops.knowledge.retrieval import KnowledgeRetrievalError
 
 LOGGER = logging.getLogger("incidentops.investigation")
@@ -79,44 +79,26 @@ class InvestigationNodes:
         model_provider: StructuredModelProvider,
         toolset: InvestigationToolset,
         *,
-        max_time_range_hours: int = 6,
-        max_tool_calls: int = 10,
-        max_attempts: int = 2,
+        policy: InvestigationPolicy | None = None,
         knowledge_retriever: KnowledgeRetriever | None = None,
-        knowledge_enabled: bool = False,
-        knowledge_required: bool = False,
-        knowledge_mode: RetrievalMode = RetrievalMode.HYBRID,
-        knowledge_top_k: int = 5,
-        knowledge_candidate_k: int = 40,
         now: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
         investigation_id_factory: Callable[[], str] | None = None,
     ) -> None:
-        if not 1 <= max_time_range_hours <= 6:
-            raise ValueError("max_time_range_hours must be between one and six")
-        if not 6 <= max_tool_calls <= 10:
-            raise ValueError("max_tool_calls must be between six and ten")
-        if not 1 <= max_attempts <= 2:
-            raise ValueError("max_attempts must be between one and two")
-        if knowledge_required and not knowledge_enabled:
-            raise ValueError("required knowledge retrieval must be enabled")
-        if knowledge_enabled and knowledge_retriever is None:
+        resolved_policy = policy or InvestigationPolicy()
+        if resolved_policy.knowledge_enabled and knowledge_retriever is None:
             raise ValueError("enabled knowledge retrieval requires a configured retriever")
-        if not 1 <= knowledge_top_k <= 10:
-            raise ValueError("knowledge_top_k must be between one and ten")
-        if not knowledge_top_k <= knowledge_candidate_k <= 100:
-            raise ValueError("knowledge_candidate_k must be between top_k and one hundred")
         self._model = model_provider
         self._toolset = toolset
-        self._max_time_range = timedelta(hours=max_time_range_hours)
-        self._max_tool_calls = max_tool_calls
-        self._max_attempts = max_attempts
+        self._max_time_range = timedelta(hours=resolved_policy.max_time_range_hours)
+        self._max_tool_calls = resolved_policy.max_tool_calls
+        self._max_attempts = resolved_policy.max_attempts
         self._knowledge_retriever = knowledge_retriever
-        self._knowledge_enabled = knowledge_enabled
-        self._knowledge_required = knowledge_required
-        self._knowledge_mode = knowledge_mode
-        self._knowledge_top_k = knowledge_top_k
-        self._knowledge_candidate_k = knowledge_candidate_k
+        self._knowledge_enabled = resolved_policy.knowledge_enabled
+        self._knowledge_required = resolved_policy.knowledge_required
+        self._knowledge_mode = resolved_policy.knowledge_mode
+        self._knowledge_top_k = resolved_policy.knowledge_top_k
+        self._knowledge_candidate_k = resolved_policy.knowledge_candidate_k
         self._now = now or (lambda: datetime.now(UTC))
         self._monotonic = monotonic or time.monotonic
         self._investigation_id_factory = investigation_id_factory or _default_investigation_id

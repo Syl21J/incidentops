@@ -6,16 +6,11 @@ import pytest
 from pydantic import ValidationError
 
 from incidentops.investigation.models import (
-    EvaluationResult,
     EvidenceAvailability,
-    IncidentReport,
     IncidentRequest,
-    IncidentStatus,
     InvestigationPlan,
     InvestigationTask,
     InvestigationTaskType,
-    InvestigationTraceEvent,
-    InvestigationTraceEventType,
     InvestigationWindow,
     LogEvidence,
     LogEvidenceType,
@@ -28,9 +23,6 @@ from incidentops.investigation.models import (
     RootCauseCode,
     RootCauseHypothesis,
     ServiceName,
-    TraceStatus,
-    VerificationDecision,
-    VerificationResult,
     evidence_id_for_task,
 )
 
@@ -230,68 +222,27 @@ def test_action_enum_rejects_forbidden_or_destructive_codes() -> None:
             )
 
 
-def test_report_trace_verification_and_evaluation_models_validate() -> None:
-    verification = VerificationResult(
-        decision=VerificationDecision.ACCEPTED,
-        selected_cause=RootCauseCode.SLOW_CONSUMER_PROCESSING,
-        verified_evidence_ids=["metric-consumer-lag-summary"],
-    )
-    report = IncidentReport(
-        investigation_id="investigation-001",
-        status=IncidentStatus.DIAGNOSED,
-        incident_summary="The order consumer accumulated lag.",
-        primary_root_cause=hypothesis(),
-        supporting_evidence=[metric_evidence()],
-        negative_evidence=[negative_evidence()],
-        recommended_actions=[
-            RecommendedAction(
-                action_code=RecommendedActionCode.INSPECT_CONSUMER_PROCESSING,
-                reason="Inspect processing latency.",
-                supporting_evidence_ids=["metric-consumer-lag-summary"],
-            )
-        ],
-        limitations=["Only the bounded incident window was inspected."],
-        tool_call_count=6,
-        investigation_attempts=1,
-        started_at=START,
-        completed_at=END,
-    )
-    trace = InvestigationTraceEvent(
-        event_id="trace-001",
-        timestamp=START,
-        event_type=InvestigationTraceEventType.INVESTIGATION_STARTED,
-        investigation_id="investigation-001",
-        status=TraceStatus.STARTED,
-    )
-    evaluation = EvaluationResult(
-        root_cause_exact_match=True,
-        root_cause_rank=1,
-        expected_metric_evidence_recall=1.0,
-        expected_log_evidence_recall=1.0,
-        negative_evidence_recall=1.0,
-        unsupported_evidence_reference_count=0,
-        forbidden_action_count=0,
-        tool_call_count=6,
-        investigation_attempt_count=1,
-        workflow_duration_seconds=10.0,
-    )
-
-    assert verification.decision == VerificationDecision.ACCEPTED
-    assert report.supporting_evidence[0].evidence_kind == "metric"
-    assert trace.timestamp.tzinfo == UTC
-    assert evaluation.root_cause_exact_match is True
-
-
 def test_stable_evidence_identifiers_cover_the_closed_toolset() -> None:
-    assert evidence_id_for_task(InvestigationTaskType.CHECK_CONSUMER_LAG) == (
-        "metric-consumer-lag-summary"
-    )
-    assert (
-        evidence_id_for_task(
-            InvestigationTaskType.FIND_DATABASE_ERRORS,
-            negative=True,
-        )
-        == "negative-no-database-errors"
-    )
-    with pytest.raises(ValueError, match="does not support"):
-        evidence_id_for_task(InvestigationTaskType.CHECK_PROCESSING_LATENCY, negative=True)
+    expected = {
+        (InvestigationTaskType.CHECK_CONSUMER_LAG, False): "metric-consumer-lag-summary",
+        (InvestigationTaskType.CHECK_PROCESSING_LATENCY, False): ("metric-processing-latency-p95"),
+        (InvestigationTaskType.COMPARE_PRODUCER_CONSUMER_RATES, False): (
+            "metric-producer-consumer-rate-comparison"
+        ),
+        (InvestigationTaskType.FIND_SLOW_PROCESSING_LOGS, False): ("log-slow-processing-summary"),
+        (InvestigationTaskType.FIND_DATABASE_ERRORS, False): "log-database-errors-summary",
+        (InvestigationTaskType.FIND_DATABASE_ERRORS, True): "negative-no-database-errors",
+        (InvestigationTaskType.FIND_KAFKA_ERRORS, False): "log-kafka-errors-summary",
+        (InvestigationTaskType.FIND_KAFKA_ERRORS, True): "negative-no-kafka-errors",
+    }
+
+    for (task_type, negative), evidence_id in expected.items():
+        assert evidence_id_for_task(task_type, negative=negative) == evidence_id
+
+    unsupported_negative_tasks = set(InvestigationTaskType) - {
+        InvestigationTaskType.FIND_DATABASE_ERRORS,
+        InvestigationTaskType.FIND_KAFKA_ERRORS,
+    }
+    for task_type in unsupported_negative_tasks:
+        with pytest.raises(ValueError, match="does not support"):
+            evidence_id_for_task(task_type, negative=True)

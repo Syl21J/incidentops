@@ -1,8 +1,10 @@
 """Integration coverage for the versioned log template and search operations."""
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import NoReturn
 from uuid import uuid4
 
 import pytest
@@ -19,6 +21,16 @@ from incidentops.log_search import (
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 TEMPLATE_FILE = PROJECT_DIR / "elasticsearch" / "index-template.json"
+REQUIRE_INTEGRATION = os.getenv("INCIDENTOPS_REQUIRE_INTEGRATION", "").lower() == "true"
+pytestmark = [pytest.mark.integration, pytest.mark.elasticsearch]
+
+
+def _unavailable(message: str) -> NoReturn:
+    """Skip optional local runs but fail when integration coverage is explicitly required."""
+
+    if REQUIRE_INTEGRATION:
+        pytest.fail(message)
+    pytest.skip(message)
 
 
 def test_template_index_search_filters_and_aggregations() -> None:
@@ -26,7 +38,8 @@ def test_template_index_search_filters_and_aggregations() -> None:
 
     client = Elasticsearch("http://localhost:9200", request_timeout=5)
     if not client.ping():
-        pytest.skip("Elasticsearch is not available on localhost:9200")
+        client.close()
+        _unavailable("Elasticsearch is not available on localhost:9200")
 
     run_id = f"integration-{uuid4().hex}"
     template_name = f"incidentops-logs-test-{uuid4().hex}"

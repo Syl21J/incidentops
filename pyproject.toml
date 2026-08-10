@@ -41,8 +41,13 @@ build-backend = "hatchling.build"
 packages = ["src/incidentops"]
 
 [tool.pytest.ini_options]
-addopts = "-ra --capture=sys"
-testpaths = ["tests"]
+addopts = "-ra --capture=sys --strict-markers"
+testpaths = ["tests/unit"]
+markers = [
+    "integration: requires one or more real backend services",
+    "elasticsearch: requires the local Elasticsearch service",
+    "prometheus: requires the local Prometheus service",
+]
 
 [tool.ruff]
 line-length = 100

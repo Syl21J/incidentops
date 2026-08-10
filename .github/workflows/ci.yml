@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   quality:
-    name: Ruff, Pyright, and pytest
+    name: Ruff, Pyright, and unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -38,5 +38,5 @@ jobs:
       - name: Run Pyright
         run: uv run --frozen pyright
 
-      - name: Run pytest
-        run: uv run --frozen pytest
+      - name: Run unit tests
+        run: uv run --frozen pytest tests/unit

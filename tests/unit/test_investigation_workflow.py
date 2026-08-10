@@ -25,6 +25,7 @@ from incidentops.investigation.models import (
     evidence_id_for_task,
 )
 from incidentops.investigation.nodes import InvestigationNodes
+from incidentops.investigation.policy import InvestigationPolicy
 from incidentops.investigation.report import assemble_incident_report, render_report_markdown
 from incidentops.investigation.state import InvestigationState
 from incidentops.investigation.tools import (
@@ -329,11 +330,13 @@ def build_nodes(
     return InvestigationNodes(
         ScriptedModelProvider(responses),
         cast(InvestigationToolset, fake_toolset),
-        max_time_range_hours=max_time_range_hours,
-        max_attempts=max_attempts,
+        policy=InvestigationPolicy(
+            max_time_range_hours=max_time_range_hours,
+            max_attempts=max_attempts,
+            knowledge_enabled=knowledge_enabled,
+            knowledge_required=knowledge_required,
+        ),
         knowledge_retriever=knowledge_retriever,
-        knowledge_enabled=knowledge_enabled,
-        knowledge_required=knowledge_required,
         now=lambda: END,
         monotonic=lambda: 1.0,
         investigation_id_factory=lambda: "investigation-test",

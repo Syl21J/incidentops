@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+# Purpose: run an isolated normal-traffic demonstration and print the main bounded Prometheus
+# summaries after verifying both application scrape targets.
+# Run when: demonstrating observability or checking application metrics and Prometheus scrape
+# configuration. This script validates and starts the existing Compose stack when needed.
+
 set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -137,7 +142,7 @@ LOG_FILE_ENABLED=false uv run python -m incidentops.producer \
   >"${PRODUCER_STDOUT}" 2>&1
 topic_created=true
 
-log "Starting the WSL consumer metrics endpoint on port 8002"
+log "Starting the consumer metrics endpoint on port 8002"
 LOG_FILE_ENABLED=false uv run python -m incidentops.consumer \
   --topic "${DEMO_TOPIC}" \
   --group "${DEMO_GROUP}" \
@@ -177,16 +182,8 @@ producer_pid=$!
 
 log "Waiting for both Prometheus targets to become healthy"
 targets_deadline=$((SECONDS + 30))
-while ! curl --fail --silent http://localhost:9090/api/v1/targets | uv run python -c '
-import json, sys
-payload = json.load(sys.stdin)
-healthy = {
-    target.get("labels", {}).get("job")
-    for target in payload["data"]["activeTargets"]
-    if target.get("health") == "up"
-}
-raise SystemExit(0 if {"incidentops-producer", "incidentops-consumer"} <= healthy else 1)
-'; do
+while ! curl --fail --silent http://localhost:9090/api/v1/targets | \
+  uv run python -m incidentops.validation.cli prometheus-targets-ready; do
   if ! kill -0 "${producer_pid}" 2>/dev/null; then
     error "The producer exited before both Prometheus targets became healthy."
     sed -n '1,200p' "${PRODUCER_STDOUT}" >&2

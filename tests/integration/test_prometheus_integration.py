@@ -1,9 +1,10 @@
 """Integration coverage for Prometheus health, scraping, and the typed client."""
 
 import json
+import os
 import time
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from typing import NoReturn
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -11,29 +12,37 @@ import pytest
 
 from incidentops.metric_query import PrometheusClient, RangeQueryParams
 from incidentops.metrics import MetricsServer, create_producer_metrics
-from incidentops.scenarios import load_scenario_manifest
 
 PROMETHEUS_URL = "http://localhost:9090"
-PROJECT_DIR = Path(__file__).resolve().parents[2]
+REQUIRE_INTEGRATION = os.getenv("INCIDENTOPS_REQUIRE_INTEGRATION", "").lower() == "true"
+pytestmark = [pytest.mark.integration, pytest.mark.prometheus]
+
+
+def _unavailable(message: str) -> NoReturn:
+    """Skip optional local runs but fail when integration coverage is explicitly required."""
+
+    if REQUIRE_INTEGRATION:
+        pytest.fail(message)
+    pytest.skip(message)
 
 
 def _require_prometheus() -> None:
     try:
         with urlopen(f"{PROMETHEUS_URL}/-/healthy", timeout=2) as response:  # noqa: S310
             if response.status != 200:
-                pytest.skip("Prometheus is not healthy on localhost:9090")
+                _unavailable("Prometheus is not healthy on localhost:9090")
     except (URLError, OSError):
-        pytest.skip("Prometheus is not available on localhost:9090")
+        _unavailable("Prometheus is not available on localhost:9090")
 
 
-def test_prometheus_health_scrape_range_query_and_manifest() -> None:
+def test_prometheus_health_scrape_and_range_query() -> None:
     _require_prometheus()
     metrics = create_producer_metrics()
     metrics.orders_produced.inc(4)
     try:
         server = MetricsServer.start(host="0.0.0.0", port=8001, registry=metrics.registry)
     except OSError:
-        pytest.skip("producer metrics port 8001 is already occupied")
+        _unavailable("producer metrics port 8001 is already occupied")
 
     try:
         deadline = time.monotonic() + 20
@@ -64,6 +73,3 @@ def test_prometheus_health_scrape_range_query_and_manifest() -> None:
         assert any(series.samples for series in result.series)
     finally:
         server.close()
-
-    manifest = load_scenario_manifest(PROJECT_DIR / "scenarios" / "slow_consumer.yaml")
-    assert manifest.id == "slow_consumer_v1"

@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+# Purpose: validate Kafka production, consumer processing, PostgreSQL persistence, idempotency, and
+# committed consumer-group offsets with isolated resources.
+# Run when: order models, producer, consumer, Kafka configuration, database logic, or migration
+# behavior changes. Kafka and PostgreSQL must already be initialized and running.
+
 set -Eeuo pipefail
 
 # Resolve the repository and create identifiers unique to this validation run.

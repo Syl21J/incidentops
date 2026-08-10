@@ -11,6 +11,7 @@ from incidentops.investigation.nodes import (
     route_after_plan,
     route_after_validation,
 )
+from incidentops.investigation.policy import InvestigationPolicy
 from incidentops.investigation.state import InvestigationState
 from incidentops.investigation.tools import InvestigationToolset
 from incidentops.knowledge.models import RetrievalMode
@@ -69,14 +70,16 @@ def build_configured_investigation_graph(
         InvestigationNodes(
             model_provider,
             toolset,
-            max_time_range_hours=settings.investigation_max_time_range_hours,
-            max_tool_calls=settings.investigation_max_tool_calls,
-            max_attempts=settings.investigation_max_attempts,
+            policy=InvestigationPolicy(
+                max_time_range_hours=settings.investigation_max_time_range_hours,
+                max_tool_calls=settings.investigation_max_tool_calls,
+                max_attempts=settings.investigation_max_attempts,
+                knowledge_enabled=settings.knowledge_enabled,
+                knowledge_required=settings.knowledge_required,
+                knowledge_mode=RetrievalMode(settings.knowledge_retrieval_mode),
+                knowledge_top_k=settings.knowledge_top_k,
+                knowledge_candidate_k=settings.knowledge_candidate_k,
+            ),
             knowledge_retriever=knowledge_retriever,
-            knowledge_enabled=settings.knowledge_enabled,
-            knowledge_required=settings.knowledge_required,
-            knowledge_mode=RetrievalMode(settings.knowledge_retrieval_mode),
-            knowledge_top_k=settings.knowledge_top_k,
-            knowledge_candidate_k=settings.knowledge_candidate_k,
         )
     )

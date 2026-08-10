@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+# Purpose: validate the complete JSONL, Filebeat, Elasticsearch, search, and aggregation path with
+# isolated application data.
+# Run when: application logging, Filebeat, the Elasticsearch template, log search, or correlation
+# fields change. The initialized Compose services must already be running.
+
 set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -87,24 +92,7 @@ cleanup() {
     rm -rf -- "${RUN_LOG_DIR}"
   fi
 
-  if ! RUN_ID_TO_DELETE="${RUN_ID}" uv run python - <<'PY'
-import os
-
-from elasticsearch import Elasticsearch
-
-client = Elasticsearch("http://localhost:9200", request_timeout=10)
-try:
-    client.delete_by_query(
-        index="incidentops-logs-*",
-        query={"term": {"run_id": os.environ["RUN_ID_TO_DELETE"]}},
-        allow_no_indices=True,
-        conflicts="proceed",
-        ignore_unavailable=True,
-        refresh=True,
-    )
-finally:
-    client.close()
-PY
+  if ! uv run python -m incidentops.validation.cli delete-run-logs "${RUN_ID}"
   then
     error "Could not delete Elasticsearch documents for run_id ${RUN_ID}."
     cleanup_failed=true
@@ -223,15 +211,7 @@ while true; do
     --run-id "${RUN_ID}" \
     --minutes 10 \
     --limit 100 >"${SEARCH_RESULT}"; then
-    if python3 - "${SEARCH_RESULT}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-services = {entry["service"] for entry in result["logs"]}
-raise SystemExit(0 if {"order-producer", "order-consumer"} <= services else 1)
-PY
+    if uv run python -m incidentops.validation.cli log-services-ready "${SEARCH_RESULT}"
     then
       break
     fi
@@ -246,15 +226,7 @@ PY
 done
 success "Elasticsearch contains producer and consumer logs for this run"
 
-python3 - "${SEARCH_RESULT}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if not any(entry.get("event_id") or entry.get("order_id") for entry in result["logs"]):
-    raise SystemExit("No indexed log contains an event_id or order_id.")
-PY
+uv run python -m incidentops.validation.cli validate-log-correlation "${SEARCH_RESULT}"
 success "At least one indexed log carries an event_id or order_id"
 
 uv run python -m incidentops.log_search aggregate \
@@ -262,32 +234,12 @@ uv run python -m incidentops.log_search aggregate \
   --run-id "${RUN_ID}" \
   --minutes 10 >"${AGGREGATION_RESULT}"
 
-python3 - "${AGGREGATION_RESULT}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-counts = {bucket["key"]: bucket["count"] for bucket in result["buckets"]}
-if not {"order-producer", "order-consumer"} <= counts.keys():
-    raise SystemExit("The service aggregation is missing an application service.")
-print(
-    "[INFO] Indexed service counts: "
-    f"order-producer={counts['order-producer']}, "
-    f"order-consumer={counts['order-consumer']}"
-)
-PY
+uv run python -m incidentops.validation.cli \
+  validate-service-aggregation "${AGGREGATION_RESULT}"
 success "Service aggregation contains both applications"
 
 indexed_count="$(
-  python3 - "${SEARCH_RESULT}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(result["total"])
-PY
+  uv run python -m incidentops.validation.cli log-total "${SEARCH_RESULT}"
 )"
 
 printf '\nIncidentOps log pipeline validation succeeded.\n'

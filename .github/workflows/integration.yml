@@ -1,0 +1,48 @@
+name: Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Elasticsearch and Prometheus integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.25"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Validate Compose
+        run: docker compose config --quiet
+
+      - name: Start required services
+        run: >-
+          docker compose up -d --wait --wait-timeout 180
+          elasticsearch prometheus
+
+      - name: Run required integration tests
+        env:
+          INCIDENTOPS_REQUIRE_INTEGRATION: "true"
+        run: uv run --frozen pytest tests/integration -m integration
+
+      - name: Show service logs after a failure
+        if: failure()
+        run: docker compose logs --tail=200 elasticsearch prometheus
+
+      - name: Stop required services
+        if: always()
+        run: docker compose stop elasticsearch prometheus

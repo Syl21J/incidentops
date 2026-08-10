@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import cast
 
 from incidentops.investigation.models import (
@@ -63,60 +63,83 @@ def _finite_number(value: object) -> float | None:
     return float(value)
 
 
-def _validate_metric_summary(item: MetricEvidence) -> list[str]:
+def _validate_consumer_lag_summary(item: MetricEvidence) -> list[str]:
     issues: list[str] = []
     raw = item.raw_value_summary
-    if item.availability == EvidenceAvailability.UNAVAILABLE:
-        return issues
-    if item.metric_type == MetricEvidenceType.CONSUMER_LAG:
-        required = {"start_value", "end_value", "minimum", "maximum", "trend", "sample_count"}
-        if not required <= raw.keys():
-            issues.append(f"consumer lag evidence {item.evidence_id} has an incomplete summary")
-        numeric = {
-            key: _finite_number(raw.get(key))
-            for key in ("start_value", "end_value", "minimum", "maximum")
-        }
-        if any(value is None or value < 0 for value in numeric.values()):
-            issues.append(f"consumer lag evidence {item.evidence_id} has invalid values")
-        elif (
-            cast(float, numeric["minimum"]) > cast(float, numeric["maximum"])
-            or not cast(float, numeric["minimum"])
-            <= cast(float, numeric["start_value"])
-            <= cast(float, numeric["maximum"])
-            or not cast(float, numeric["minimum"])
-            <= cast(float, numeric["end_value"])
-            <= cast(float, numeric["maximum"])
-        ):
-            issues.append(f"consumer lag evidence {item.evidence_id} is internally inconsistent")
-        if raw.get("trend") not in {"increasing", "stable", "decreasing"}:
-            issues.append(f"consumer lag evidence {item.evidence_id} has an invalid trend")
-        sample_count = raw.get("sample_count")
-        if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
-            issues.append(f"consumer lag evidence {item.evidence_id} has no samples")
-    elif item.metric_type == MetricEvidenceType.PROCESSING_LATENCY:
-        duration = _finite_number(raw.get("duration_seconds"))
-        if duration is None or duration < 0 or raw.get("percentile") != 0.95:
-            issues.append(f"processing latency evidence {item.evidence_id} has invalid values")
-        sample_count = raw.get("sample_count")
-        if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
-            issues.append(f"processing latency evidence {item.evidence_id} has no samples")
-    elif item.metric_type == MetricEvidenceType.PRODUCER_CONSUMER_RATES:
-        producer = _finite_number(raw.get("producer_windowed_rate_per_second"))
-        consumer = _finite_number(raw.get("consumer_windowed_rate_per_second"))
-        difference = _finite_number(raw.get("windowed_rate_difference_per_second"))
-        slower = raw.get("consumer_is_slower")
-        if producer is None or producer < 0 or consumer is None or consumer < 0:
-            issues.append(f"rate evidence {item.evidence_id} has invalid values")
-        if not isinstance(slower, bool):
-            issues.append(f"rate evidence {item.evidence_id} has an invalid comparison")
-        if (
-            producer is not None
-            and consumer is not None
-            and difference is not None
-            and (abs(difference - (producer - consumer)) > 1e-9 or slower is not (difference > 0))
-        ):
-            issues.append(f"rate evidence {item.evidence_id} is internally inconsistent")
+    required = {"start_value", "end_value", "minimum", "maximum", "trend", "sample_count"}
+    if not required <= raw.keys():
+        issues.append(f"consumer lag evidence {item.evidence_id} has an incomplete summary")
+    numeric = {
+        key: _finite_number(raw.get(key))
+        for key in ("start_value", "end_value", "minimum", "maximum")
+    }
+    if any(value is None or value < 0 for value in numeric.values()):
+        issues.append(f"consumer lag evidence {item.evidence_id} has invalid values")
+    elif (
+        cast(float, numeric["minimum"]) > cast(float, numeric["maximum"])
+        or not cast(float, numeric["minimum"])
+        <= cast(float, numeric["start_value"])
+        <= cast(float, numeric["maximum"])
+        or not cast(float, numeric["minimum"])
+        <= cast(float, numeric["end_value"])
+        <= cast(float, numeric["maximum"])
+    ):
+        issues.append(f"consumer lag evidence {item.evidence_id} is internally inconsistent")
+    if raw.get("trend") not in {"increasing", "stable", "decreasing"}:
+        issues.append(f"consumer lag evidence {item.evidence_id} has an invalid trend")
+    sample_count = raw.get("sample_count")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
+        issues.append(f"consumer lag evidence {item.evidence_id} has no samples")
     return issues
+
+
+def _validate_processing_latency_summary(item: MetricEvidence) -> list[str]:
+    issues: list[str] = []
+    raw = item.raw_value_summary
+    duration = _finite_number(raw.get("duration_seconds"))
+    if duration is None or duration < 0 or raw.get("percentile") != 0.95:
+        issues.append(f"processing latency evidence {item.evidence_id} has invalid values")
+    sample_count = raw.get("sample_count")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
+        issues.append(f"processing latency evidence {item.evidence_id} has no samples")
+    return issues
+
+
+def _validate_rate_summary(item: MetricEvidence) -> list[str]:
+    issues: list[str] = []
+    raw = item.raw_value_summary
+    producer = _finite_number(raw.get("producer_windowed_rate_per_second"))
+    consumer = _finite_number(raw.get("consumer_windowed_rate_per_second"))
+    difference = _finite_number(raw.get("windowed_rate_difference_per_second"))
+    slower = raw.get("consumer_is_slower")
+    if producer is None or producer < 0 or consumer is None or consumer < 0:
+        issues.append(f"rate evidence {item.evidence_id} has invalid values")
+    if not isinstance(slower, bool):
+        issues.append(f"rate evidence {item.evidence_id} has an invalid comparison")
+    if (
+        producer is not None
+        and consumer is not None
+        and difference is not None
+        and (abs(difference - (producer - consumer)) > 1e-9 or slower is not (difference > 0))
+    ):
+        issues.append(f"rate evidence {item.evidence_id} is internally inconsistent")
+    return issues
+
+
+_METRIC_SUMMARY_VALIDATORS: dict[
+    MetricEvidenceType,
+    Callable[[MetricEvidence], list[str]],
+] = {
+    MetricEvidenceType.CONSUMER_LAG: _validate_consumer_lag_summary,
+    MetricEvidenceType.PROCESSING_LATENCY: _validate_processing_latency_summary,
+    MetricEvidenceType.PRODUCER_CONSUMER_RATES: _validate_rate_summary,
+}
+
+
+def _validate_metric_summary(item: MetricEvidence) -> list[str]:
+    if item.availability == EvidenceAvailability.UNAVAILABLE:
+        return []
+    return _METRIC_SUMMARY_VALIDATORS[item.metric_type](item)
 
 
 def _validate_log_summary(item: LogEvidence | NegativeEvidence) -> list[str]:
@@ -208,33 +231,68 @@ def _slow_consumer_issues(
     return issues
 
 
+type EvidenceById = dict[str, MetricEvidence | LogEvidence | NegativeEvidence]
+type CauseValidator = Callable[[set[str], EvidenceById], list[str]]
+
+
+def _database_latency_issues(
+    supporting_ids: set[str],
+    evidence_by_id: EvidenceById,
+) -> list[str]:
+    evidence_id = evidence_id_for_task(InvestigationTaskType.FIND_DATABASE_ERRORS)
+    item = evidence_by_id.get(evidence_id)
+    if (
+        evidence_id not in supporting_ids
+        or not isinstance(item, LogEvidence)
+        or item.matching_log_count <= 0
+    ):
+        return ["database latency lacks positive database evidence"]
+    latency_id = evidence_id_for_task(InvestigationTaskType.CHECK_PROCESSING_LATENCY)
+    if latency_id not in supporting_ids:
+        return ["database latency lacks processing latency evidence"]
+    return []
+
+
+def _kafka_broker_failure_issues(
+    supporting_ids: set[str],
+    evidence_by_id: EvidenceById,
+) -> list[str]:
+    evidence_id = evidence_id_for_task(InvestigationTaskType.FIND_KAFKA_ERRORS)
+    item = evidence_by_id.get(evidence_id)
+    if (
+        evidence_id not in supporting_ids
+        or not isinstance(item, LogEvidence)
+        or item.matching_log_count <= 0
+    ):
+        return ["Kafka broker failure lacks positive Kafka evidence"]
+    return []
+
+
+def _traffic_spike_issues(_supporting_ids: set[str], _evidence_by_id: EvidenceById) -> list[str]:
+    return ["traffic spike cannot be distinguished without producer target-rate evidence"]
+
+
+def _insufficient_evidence_issues(
+    _supporting_ids: set[str],
+    _evidence_by_id: EvidenceById,
+) -> list[str]:
+    return ["insufficient evidence is not a positive diagnosis"]
+
+
+_ALTERNATIVE_CAUSE_VALIDATORS: dict[RootCauseCode, CauseValidator] = {
+    RootCauseCode.DATABASE_LATENCY: _database_latency_issues,
+    RootCauseCode.KAFKA_BROKER_FAILURE: _kafka_broker_failure_issues,
+    RootCauseCode.TRAFFIC_SPIKE: _traffic_spike_issues,
+    RootCauseCode.INSUFFICIENT_EVIDENCE: _insufficient_evidence_issues,
+}
+
+
 def _alternative_cause_issues(
     cause_code: RootCauseCode,
     supporting_ids: set[str],
-    evidence_by_id: dict[str, MetricEvidence | LogEvidence | NegativeEvidence],
+    evidence_by_id: EvidenceById,
 ) -> list[str]:
-    if cause_code == RootCauseCode.DATABASE_LATENCY:
-        evidence_id = evidence_id_for_task(InvestigationTaskType.FIND_DATABASE_ERRORS)
-        item = evidence_by_id.get(evidence_id)
-        if evidence_id not in supporting_ids or not isinstance(item, LogEvidence):
-            return ["database latency lacks positive database evidence"]
-        if item.matching_log_count <= 0:
-            return ["database latency lacks positive database evidence"]
-        latency_id = evidence_id_for_task(InvestigationTaskType.CHECK_PROCESSING_LATENCY)
-        if latency_id not in supporting_ids:
-            return ["database latency lacks processing latency evidence"]
-        return []
-    if cause_code == RootCauseCode.KAFKA_BROKER_FAILURE:
-        evidence_id = evidence_id_for_task(InvestigationTaskType.FIND_KAFKA_ERRORS)
-        item = evidence_by_id.get(evidence_id)
-        if evidence_id not in supporting_ids or not isinstance(item, LogEvidence):
-            return ["Kafka broker failure lacks positive Kafka evidence"]
-        if item.matching_log_count <= 0:
-            return ["Kafka broker failure lacks positive Kafka evidence"]
-        return []
-    if cause_code == RootCauseCode.TRAFFIC_SPIKE:
-        return ["traffic spike cannot be distinguished without producer target-rate evidence"]
-    return ["insufficient evidence is not a positive diagnosis"]
+    return _ALTERNATIVE_CAUSE_VALIDATORS[cause_code](supporting_ids, evidence_by_id)
 
 
 def verify_investigation_state(state: InvestigationState) -> VerificationResult:

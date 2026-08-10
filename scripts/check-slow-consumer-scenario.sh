@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# Purpose: reproduce slow_consumer_v1 and validate its bounded metric, log, and negative evidence.
+# Run when: producer or consumer metrics, lag calculation, slow-processing logs, scenario settings,
+# or evidence thresholds change. The initialized Compose services must already be running.
+
 set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -164,24 +168,7 @@ cleanup() {
 
   if [[ "${retain_investigation_data}" == "true" && "${investigation_data_ready}" == "true" ]]; then
     log "Retaining Elasticsearch documents for bounded follow-up investigation"
-  elif ! RUN_ID_TO_DELETE="${RUN_ID}" uv run python - <<'PY'
-import os
-
-from elasticsearch import Elasticsearch
-
-client = Elasticsearch("http://localhost:9200", request_timeout=10)
-try:
-    client.delete_by_query(
-        index="incidentops-logs-*",
-        query={"term": {"run_id": os.environ["RUN_ID_TO_DELETE"]}},
-        allow_no_indices=True,
-        conflicts="proceed",
-        ignore_unavailable=True,
-        refresh=True,
-    )
-finally:
-    client.close()
-PY
+  elif ! uv run python -m incidentops.validation.cli delete-run-logs "${RUN_ID}"
   then
     error "Could not delete Elasticsearch documents for run_id ${RUN_ID}."
     cleanup_failed=true
@@ -247,16 +234,8 @@ docker compose exec -T filebeat \
   filebeat test output -c /usr/share/filebeat/filebeat.yml >/dev/null
 success "Filebeat is healthy and can reach Elasticsearch"
 
-uv run python - "${PROJECT_DIR}/scenarios/slow_consumer.yaml" <<'PY'
-import sys
-from pathlib import Path
-
-from incidentops.scenarios import load_scenario_manifest
-
-manifest = load_scenario_manifest(Path(sys.argv[1]))
-if manifest.id != "slow_consumer_v1":
-    raise SystemExit("Unexpected scenario manifest ID")
-PY
+uv run python -m incidentops.validation.cli validate-scenario \
+  "${PROJECT_DIR}/scenarios/slow_consumer.yaml" slow_consumer_v1
 success "The slow_consumer_v1 ground-truth manifest is valid"
 
 log "Creating isolated Kafka topic ${TEST_TOPIC}"
@@ -311,18 +290,10 @@ LOG_DIRECTORY="${RUN_LOG_DIR}" uv run python -m incidentops.producer \
   >"${PRODUCER_STDOUT}" 2>&1 &
 producer_pid=$!
 
-log "Waiting for Prometheus to report both WSL targets as healthy"
+log "Waiting for Prometheus to report both application targets as healthy"
 targets_deadline=$((SECONDS + 30))
-while ! curl --fail --silent http://localhost:9090/api/v1/targets | uv run python -c '
-import json, sys
-payload = json.load(sys.stdin)
-healthy = {
-    target.get("labels", {}).get("job")
-    for target in payload["data"]["activeTargets"]
-    if target.get("health") == "up"
-}
-raise SystemExit(0 if {"incidentops-producer", "incidentops-consumer"} <= healthy else 1)
-'; do
+while ! curl --fail --silent http://localhost:9090/api/v1/targets | \
+  uv run python -m incidentops.validation.cli prometheus-targets-ready; do
   if ! kill -0 "${producer_pid}" 2>/dev/null; then
     error "Producer exited before both Prometheus targets became healthy."
     sed -n '1,240p' "${PRODUCER_STDOUT}" >&2
@@ -343,7 +314,7 @@ docker compose exec -T prometheus \
 docker compose exec -T prometheus \
   wget -qO- http://host.docker.internal:8002/metrics | \
   grep -F 'incidentops_kafka_consumer_lag' >/dev/null
-success "Both WSL metrics endpoints are reachable from inside Prometheus"
+success "Both application metrics endpoints are reachable from inside Prometheus"
 
 producer_deadline=$((SECONDS + 30))
 while kill -0 "${producer_pid}" 2>/dev/null; do
@@ -364,65 +335,11 @@ success "Producer delivered all ${EVENT_COUNT} events"
 log "Polling bounded metric summaries until the incident evidence is complete"
 metric_deadline=$((SECONDS + WAIT_TIMEOUT_SECONDS))
 while true; do
-  if SCENARIO_START="${scenario_start}" uv run python - <<'PY' >"${METRIC_RESULT}" 2>/dev/null
-import os
-from datetime import UTC, datetime
-
-from incidentops.metric_query import (
-    PrometheusClient,
-    compare_production_and_processing_rates,
-    get_consumer_lag_summary,
-    get_processing_latency_summary,
-)
-
-start = datetime.fromisoformat(os.environ["SCENARIO_START"].replace("Z", "+00:00"))
-end = datetime.now(UTC)
-client = PrometheusClient("http://localhost:9090")
-lag = get_consumer_lag_summary(client, start=start, end=end, step_seconds=2)
-latency = get_processing_latency_summary(
-    client,
-    percentile=0.95,
-    start=start,
-    end=end,
-    step_seconds=2,
-)
-rates = compare_production_and_processing_rates(client, start=start, end=end, step_seconds=2)
-print(
-    "{" +
-    f'"maximum_lag":{lag.maximum},' +
-    f'"lag_start":{lag.start_value},' +
-    f'"lag_end":{lag.end_value},' +
-    f'"lag_trend":"{lag.trend}",' +
-    f'"lag_samples":{lag.sample_count},' +
-    f'"p95_seconds":{latency.duration_seconds},' +
-    f'"latency_samples":{latency.sample_count},' +
-    f'"producer_rate":{rates.producer_rate},' +
-    f'"consumer_rate":{rates.consumer_rate},' +
-    f'"consumer_is_slower":{str(rates.consumer_is_slower).lower()}' +
-    "}"
-)
-PY
+  if uv run python -m incidentops.validation.cli collect-slow-consumer-metrics \
+    --start "${scenario_start}" >"${METRIC_RESULT}" 2>/dev/null
   then
-    if uv run python - "${METRIC_RESULT}" "${MINIMUM_LAG}" "${MINIMUM_P95_SECONDS}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-minimum_lag = float(sys.argv[2])
-minimum_p95 = float(sys.argv[3])
-valid = (
-    result["maximum_lag"] >= minimum_lag
-    and result["lag_end"] > result["lag_start"]
-    and result["lag_trend"] == "increasing"
-    and result["lag_samples"] >= 4
-    and result["p95_seconds"] >= minimum_p95
-    and result["latency_samples"] >= 2
-    and result["consumer_is_slower"]
-    and result["producer_rate"] > result["consumer_rate"]
-)
-raise SystemExit(0 if valid else 1)
-PY
+    if uv run python -m incidentops.validation.cli slow-consumer-metrics-ready \
+      "${METRIC_RESULT}" "${MINIMUM_LAG}" "${MINIMUM_P95_SECONDS}"
     then
       break
     fi
@@ -457,14 +374,9 @@ while true; do
     --event-type slow_processing \
     --minutes 10 \
     --limit 500 >"${LOG_RESULT}"; then
-    slow_log_count="$(uv run python - "${LOG_RESULT}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["total"])
-PY
-)"
+    slow_log_count="$(
+      uv run python -m incidentops.validation.cli log-total "${LOG_RESULT}"
+    )"
     if (( slow_log_count > 0 )); then
       break
     fi
@@ -489,19 +401,7 @@ uv run python -m incidentops.log_search search \
   --limit 500 >"${ERROR_LOG_RESULT}"
 
 read -r database_error_count kafka_error_count < <(
-  uv run python - "${ERROR_LOG_RESULT}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-logs = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["logs"]
-database_events = {"database_connection_failed", "database_write_failed"}
-kafka_events = {"consumer_error", "producer_error", "delivery_failed", "topic_error"}
-print(
-    sum(item["event_type"] in database_events for item in logs),
-    sum(item["event_type"] in kafka_events for item in logs),
-)
-PY
+  uv run python -m incidentops.validation.cli error-log-counts "${ERROR_LOG_RESULT}"
 )
 if [[ "${database_error_count}" != "0" || "${kafka_error_count}" != "0" ]]; then
   error "Unexpected database or Kafka error evidence was indexed."
@@ -521,68 +421,21 @@ success "All temporary application processes are stopped"
 scenario_end="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 read -r maximum_lag p95_seconds producer_rate consumer_rate < <(
-  uv run python - "${METRIC_RESULT}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(
-    result["maximum_lag"],
-    result["p95_seconds"],
-    result["producer_rate"],
-    result["consumer_rate"],
-)
-PY
+  uv run python -m incidentops.validation.cli metric-values "${METRIC_RESULT}"
 )
 
 if [[ -n "${output_metadata}" ]]; then
-  uv run python - \
-    "${output_metadata}" \
-    "${METRIC_RESULT}" \
-    "${RUN_ID}" \
-    "${TEST_TOPIC}" \
-    "${TEST_GROUP}" \
-    "${scenario_start}" \
-    "${scenario_end}" \
-    "${slow_log_count}" \
-    "${database_error_count}" \
-    "${kafka_error_count}" <<'PY'
-import json
-import sys
-import tempfile
-from pathlib import Path
-
-output_path = Path(sys.argv[1])
-metric_path = Path(sys.argv[2])
-payload = {
-    "schema_version": 1,
-    "scenario_id": "slow_consumer_v1",
-    "run_id": sys.argv[3],
-    "topic": sys.argv[4],
-    "consumer_group": sys.argv[5],
-    "start_time": sys.argv[6],
-    "end_time": sys.argv[7],
-    "observations": {
-        **json.loads(metric_path.read_text(encoding="utf-8")),
-        "slow_processing_log_count": int(sys.argv[8]),
-        "database_error_count": int(sys.argv[9]),
-        "kafka_error_count": int(sys.argv[10]),
-    },
-}
-output_path.parent.mkdir(parents=True, exist_ok=True)
-with tempfile.NamedTemporaryFile(
-    mode="w",
-    encoding="utf-8",
-    dir=output_path.parent,
-    prefix=f".{output_path.name}.",
-    delete=False,
-) as handle:
-    json.dump(payload, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-    temporary_path = Path(handle.name)
-temporary_path.replace(output_path)
-PY
+  uv run python -m incidentops.validation.cli write-scenario-metadata \
+    --output "${output_metadata}" \
+    --metrics "${METRIC_RESULT}" \
+    --run-id "${RUN_ID}" \
+    --topic "${TEST_TOPIC}" \
+    --consumer-group "${TEST_GROUP}" \
+    --start-time "${scenario_start}" \
+    --end-time "${scenario_end}" \
+    --slow-processing-log-count "${slow_log_count}" \
+    --database-error-count "${database_error_count}" \
+    --kafka-error-count "${kafka_error_count}"
   investigation_data_ready=true
   success "Scenario metadata written to ${output_metadata}"
 fi
