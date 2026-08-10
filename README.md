@@ -1,74 +1,77 @@
 # IncidentOps
 
-IncidentOps implements a local order-processing path with logs and Prometheus metrics:
+IncidentOps is a local, educational incident-investigation project built around an
+idempotent order-processing pipeline. It combines Kafka and PostgreSQL with structured logs,
+Prometheus metrics, a bounded LangGraph workflow, and optional retrieval from a controlled
+operational knowledge base.
+
+The project is intentionally not production-ready. Authentication, TLS, high availability,
+external secret management, retention operations, and automatic remediation are outside its
+current scope.
+
+## Architecture
 
 ```text
-Order producer -> Kafka -> Order consumer -> PostgreSQL
+                         order events
+Python producer  ------------------------------>  Kafka
+                                                     |
+                                                     v
+                                              Python consumer
+                                                     |
+                                                     v
+                                                PostgreSQL
 
-Producer and consumer
-              |
-              v
-  logs/*.jsonl (one file per service)
-              |
-              v
-     Filebeat 8.19.17 in Docker
-              |
-              v
- incidentops-logs-YYYY.MM.DD in Elasticsearch
-              |
-              v
- bounded Python search and aggregation tools
-
-Producer and consumer
-              |
-              +-- HTTP :8001/metrics and :8002/metrics
-              |
-              v
- Prometheus 3.12.0 in Docker Compose
-              |
-              v
- bounded typed metric tools
+producer + consumer                producer + consumer
+        |                                   |
+        v                                   v
+ JSONL log files                      /metrics endpoints
+        |                                   |
+        v                                   v
+    Filebeat                            Prometheus
+        |                                   |
+        v                                   |
+ Elasticsearch logs -----------------------+
+                                            | bounded typed queries
+                                            v
+                                 LangGraph investigation
+                                            |
+controlled knowledge ----------------------+ optional bounded RAG
+                                            |
+                                            v
+                                 validated incident report
 ```
 
-The Python applications are not containerized. They expose metrics directly from WSL and
-always write JSON logs to stdout and can
-also append the same records to local JSON Lines files. Filebeat is the only log shipper: it
-tails those files, remembers offsets in a persistent registry, and sends parsed fields to
-Elasticsearch. The applications have no Elasticsearch dependency and continue to process
-orders when Filebeat or Elasticsearch is unavailable.
+The Python producer, consumer, and command-line tools run on the host. Docker Compose runs
+PostgreSQL, Kafka, Elasticsearch, Filebeat, and Prometheus. Named volumes preserve service
+state across ordinary container restarts.
 
-## Project status
+## How the services work
 
-IncidentOps is an educational local-development project. The first five implementation
-stages are complete:
+- **Producer:** validates generated order events, publishes them to Kafka, emits JSON logs,
+  and exposes production metrics on port `8001`.
+- **Consumer:** reads Kafka events, writes them idempotently to PostgreSQL, reports consumer
+  lag and processing metrics on port `8002`, and emits correlated JSON logs.
+- **Filebeat and Elasticsearch:** Filebeat tails `logs/*.jsonl`, keeps its read position in a
+  persistent registry, and indexes structured events in `incidentops-logs-*`.
+- **Prometheus:** scrapes both application endpoints and retains local samples for six hours,
+  with a 512 MB size limit.
+- **Investigation workflow:** a fixed LangGraph collects allow-listed metric and log evidence,
+  asks the configured model for structured planning and hypotheses, verifies the evidence in
+  Python, and produces a validated report.
+- **Knowledge retrieval:** an optional hybrid search indexes the controlled documents under
+  `knowledge/`. Retrieved text is untrusted context and cannot replace live evidence.
 
-- PostgreSQL, Kafka, Elasticsearch, and Filebeat run as healthy Docker Compose services.
-- The Python producer and consumer run directly in WSL and implement an idempotent
-  Kafka-to-PostgreSQL order pipeline.
-- Application logs are validated JSON, written to stdout and optional JSONL files, shipped by
-  Filebeat, and searchable through bounded typed Python tools.
-- Unit tests cover configuration, logging, query construction, response validation, and
-  processing behavior. Local integration and end-to-end scripts cover the real services.
-- Prometheus scrapes producer and consumer endpoints, typed tools expose bounded metric
-  summaries, and the versioned `slow_consumer_v1` scenario validates correlated metrics and
-  Elasticsearch logs.
-- A bounded LangGraph workflow plans and investigates `slow_consumer_v1` using the live typed
-  Prometheus and Elasticsearch tools, validates model output with Pydantic, verifies evidence
-  deterministically, and produces an evaluated structured report.
-- GitHub Actions runs formatting, linting, type checking, and tests for every push to `main`
-  and every pull request.
+The workflow accepts no raw PromQL or Elasticsearch DSL. Incident windows, result sizes,
+tool calls, attempts, rechecks, and model calls are hard-bounded. The model cannot run shell,
+Docker, Kafka administration, database-write, or remediation tools.
 
-This is not a production deployment. Authentication, TLS, external secret management,
-retention policies, high availability, and production operations are intentionally outside
-the current local MVP.
+## Requirements
 
-## Prerequisites
-
-- Docker Compose v2
+- Docker with Compose v2
 - Python 3.12 or newer
 - [`uv`](https://docs.astral.sh/uv/)
 - At least 4 GiB of available memory
-- `vm.max_map_count` greater than or equal to `262144`
+- `vm.max_map_count >= 262144` for Elasticsearch
 
 ## Setup
 
@@ -76,33 +79,26 @@ Create the local configuration and install the locked Python environment:
 
 ```bash
 cp .env.example .env
-uv sync
+chmod 600 .env
+uv sync --frozen
 mkdir -p logs
 ```
 
-The example password is only a local placeholder. Change it before using this setup beyond
-local development.
+The values in `.env.example` are for local development. Keep `.env` untracked and replace the
+placeholder database password if the environment is exposed beyond your machine.
 
-Validate and start the infrastructure:
+Validate Compose, start the infrastructure, and initialize Elasticsearch and PostgreSQL:
 
 ```bash
 docker compose config
 docker compose up -d
 ./scripts/check-infrastructure.sh
-```
-
-Install the versioned Elasticsearch index template and apply the database migration:
-
-```bash
 ./scripts/initialize-elasticsearch.sh
 ./scripts/initialize-database.sh
 ```
 
-Initialize the template before producing application logs on a new environment. The script
-waits for Elasticsearch, creates or updates the `incidentops-logs` template, and verifies both
-the template and any existing matching index mappings. It never deletes an index.
-
-Stop the containers without deleting their named volumes:
+Run `docker compose config` again after every Compose or environment change. To stop the
+project while preserving all named volumes:
 
 ```bash
 docker compose down
@@ -110,809 +106,236 @@ docker compose down
 
 ## Run the order pipeline
 
-Start the consumer directly in WSL:
+Start the consumer:
 
 ```bash
-uv run python -m incidentops.consumer --run-id manual-example
+uv run incidentops-consumer --run-id manual-example
 ```
 
-Produce orders from another WSL terminal:
+In another terminal, produce a batch:
 
 ```bash
-uv run python -m incidentops.producer \
+uv run incidentops-producer \
   --count 50 \
   --rate 10 \
   --run-id manual-example
 ```
 
-Run the reproducible Kafka/PostgreSQL end-to-end check:
+Use the same `run-id` to correlate database activity, logs, and investigation evidence. For
+an isolated end-to-end check of Kafka, the consumer, and PostgreSQL, run:
 
 ```bash
 ./scripts/check-pipeline.sh
 ```
 
-The check uses an isolated Kafka topic, consumer group, and customer prefix. It removes only
-the topic, group, process, and database rows that it creates.
+## Inspect logs and metrics
 
-## Log files and Filebeat
-
-File logging is enabled by default:
+Application logs are written to stdout and, by default, to:
 
 ```text
 logs/order-producer.jsonl
 logs/order-consumer.jsonl
 ```
 
-Each line is one complete UTF-8 JSON object. The application timestamp is an ISO 8601 UTC
-value in `@timestamp`; exceptions remain escaped inside a single valid JSON line. Filebeat
-mounts `./logs` read-only, uses a `filestream` input with an NDJSON parser, and keeps decoded
-application fields at the document root.
-
-Filebeat state is stored in the `filebeat_data` named volume. Its stable input ID and
-content-based file fingerprints prevent ordinary container restarts from replaying every
-previously acknowledged line. The registry is operational state and must not be deleted as a
-routine troubleshooting step.
-
-Check Filebeat explicitly:
+Search and aggregate them through the bounded CLI:
 
 ```bash
-docker compose ps filebeat
-docker compose exec -T filebeat \
-  filebeat test config -c /usr/share/filebeat/filebeat.yml
-docker compose exec -T filebeat \
-  filebeat test output -c /usr/share/filebeat/filebeat.yml
-docker compose logs --tail=100 filebeat
-```
-
-## Elasticsearch log mapping
-
-Filebeat writes daily regular indices named `incidentops-logs-YYYY.MM.DD`. ILM and data
-streams are intentionally disabled for this local MVP. The versioned template at
-`elasticsearch/index-template.json` matches `incidentops-logs-*` and defines:
-
-| Field | Elasticsearch type | Purpose |
-| --- | --- | --- |
-| `@timestamp` | `date` | Application event time |
-| `level` | `keyword` | Exact severity filter |
-| `service` | `keyword` | Exact service filter |
-| `event_type` | `keyword` | Exact event category and aggregation |
-| `logger` | `keyword` | Exact logger filter |
-| `message` | `text` | Full-text search |
-| `event_id` | `keyword` | Exact event correlation |
-| `order_id` | `keyword` | Exact order correlation |
-| `duration_ms` | `float` | Numeric processing duration |
-| `error_type` | `keyword` | Exact error category |
-| `run_id` | `keyword` | Exact end-to-end run correlation |
-
-The template also types the existing operational context fields (`topic`, `consumer_group`,
-counts, insertion status, and readable exception text). Unknown Filebeat metadata remains in
-`_source` but is not added dynamically to the mapping.
-
-## Search and aggregation CLI
-
-All searches use allow-listed filters, a mandatory or default recent time window, and a
-maximum result limit of 500. The CLI never accepts raw Elasticsearch JSON.
-
-Search recent consumer `INFO` logs:
-
-```bash
-uv run python -m incidentops.log_search search \
-  --service order-consumer \
-  --level INFO \
-  --minutes 15
-```
-
-Correlate a complete run:
-
-```bash
-uv run python -m incidentops.log_search search \
-  --run-id pipeline-check-example
-```
-
-Run a full-text search:
-
-```bash
-uv run python -m incidentops.log_search search \
-  --message "order event processed" \
+uv run incidentops-log-search search \
+  --run-id manual-example \
   --minutes 30
-```
 
-Count logs by an allow-listed keyword field:
-
-```bash
-uv run python -m incidentops.log_search aggregate \
+uv run incidentops-log-search aggregate \
   --group-by event_type \
   --minutes 30
 ```
 
-Build a one-minute consumer timeline:
+Query the predefined Prometheus summaries:
 
 ```bash
-uv run python -m incidentops.log_search timeline \
-  --service order-consumer \
-  --interval 1m \
-  --minutes 30
+uv run incidentops-metric-query lag --minutes 10
+uv run incidentops-metric-query rates --minutes 10
+uv run incidentops-metric-query latency --percentile 0.95 --minutes 10
 ```
 
-The Python API in `incidentops.log_search` exposes the typed functions `search_logs`,
-`count_logs_by_event_type`, and `get_log_timeline`. Pydantic validates query parameters and
-Elasticsearch responses.
-
-### Real Elasticsearch search example
-
-The following result was returned by the local Elasticsearch instance after producing the
-deterministic run `demo-elasticsearch-1`:
-
-```bash
-uv run python -m incidentops.log_search search \
-  --run-id demo-elasticsearch-1 \
-  --service order-producer \
-  --event-type production_summary \
-  --minutes 10080 \
-  --limit 1
-```
-
-```json
-{
-  "total": 1,
-  "logs": [
-    {
-      "@timestamp": "2026-07-29T13:20:49.117000Z",
-      "level": "INFO",
-      "service": "order-producer",
-      "event_type": "production_summary",
-      "message": "Order production completed",
-      "logger": "order-producer",
-      "event_id": null,
-      "order_id": null,
-      "duration_ms": 1858.55,
-      "error_type": null,
-      "run_id": "demo-elasticsearch-1"
-    }
-  ]
-}
-```
-
-The exact `run_id`, `service`, and `event_type` filters select the final producer summary.
-`duration_ms` shows that producing and acknowledging the ten-event batch took about 1.86
-seconds.
-
-### Real Elasticsearch aggregation example
-
-```bash
-uv run python -m incidentops.log_search aggregate \
-  --group-by event_type \
-  --run-id demo-elasticsearch-1 \
-  --minutes 10080
-```
-
-```json
-{
-  "group_by": "event_type",
-  "buckets": [
-    {"key": "order_processed", "count": 10},
-    {"key": "consumer_error", "count": 2},
-    {"key": "consumer_started", "count": 2},
-    {"key": "consumer_summary", "count": 2},
-    {"key": "shutdown_requested", "count": 2},
-    {"key": "partitions_assigned", "count": 1},
-    {"key": "production_summary", "count": 1},
-    {"key": "topic_created", "count": 1}
-  ]
-}
-```
-
-The ten `order_processed` documents correspond to the ten generated orders. The startup,
-topic, partition, shutdown, and summary buckets describe the surrounding application
-lifecycle. The two early `consumer_error` documents record attempts made before the Kafka
-topic existed; they remain searchable operational evidence rather than being hidden.
-
-## End-to-end log validation
-
-Run the complete collection and search check:
-
-```bash
-./scripts/check-log-pipeline.sh
-```
-
-It checks the existing infrastructure, installs the template, validates Filebeat, starts a
-bounded consumer, produces a deterministic batch, waits with explicit deadlines, finds both
-services by a unique `run_id`, verifies event correlation fields, and runs a service
-aggregation. Cleanup targets only that run's Kafka topic and group, PostgreSQL rows, temporary
-processes/files, isolated JSONL subdirectory, and Elasticsearch documents selected by its exact
-`run_id`. It never deletes an application index or Docker volume.
-
-## Prometheus metrics architecture
-
-Prometheus 3.12.0 runs in Docker Compose with a six-hour/512 MB local retention limit and the
-named `prometheus_data` volume. It listens only on `127.0.0.1:9090`. The Python applications
-continue to run directly in WSL and bind their metrics endpoints to `0.0.0.0` so the
-Prometheus container can scrape them through `host.docker.internal` and the Compose
-`host-gateway` mapping. A stopped application can make its target temporarily `down`; this
-does not make Prometheus unhealthy.
-
-Start the infrastructure and open the UI at [http://localhost:9090](http://localhost:9090):
-
-```bash
-docker compose config
-docker compose up -d
-docker compose ps prometheus
-curl --fail http://localhost:9090/-/healthy
-```
-
-Start both application endpoints from WSL:
-
-```bash
-uv run python -m incidentops.consumer --run-id metrics-example
-
-uv run python -m incidentops.producer \
-  --count 100 \
-  --rate 10 \
-  --run-id metrics-example
-```
-
-For the same normal, isolated demonstration in one command:
+The Prometheus demo starts an isolated producer and consumer, verifies both scrape targets,
+and prints the main summaries:
 
 ```bash
 ./scripts/run-prometheus-demo.sh
 ```
 
-The script starts and checks Compose, uses a unique topic, group, and `run_id`, verifies both
-targets as `UP`, then prints the bounded lag, rate, and P95 summaries. It leaves recent metric
-samples in Prometheus but removes only the temporary Kafka and PostgreSQL resources it created.
-The event count and producer rate can be adjusted with `PROMETHEUS_DEMO_EVENT_COUNT` and
-`PROMETHEUS_DEMO_PRODUCER_RATE`.
+### Local endpoints
 
-The producer endpoint uses port 8001 and the consumer endpoint uses port 8002 by default.
-`--metrics-host`, `--metrics-port`, and `--no-metrics` provide explicit CLI control. Merely
-importing a module never starts a server, collectors use isolated registries, and no custom
-metric has an application label. In particular, `event_id`, `order_id`, `run_id`, and
-exception messages are never metric labels.
+| Service | Endpoint |
+| --- | --- |
+| PostgreSQL | `localhost:5432` |
+| Kafka | `localhost:9092` |
+| Elasticsearch | `http://localhost:9200` |
+| Prometheus | `http://localhost:9090` |
+| Producer metrics | `http://localhost:8001/metrics` |
+| Consumer metrics | `http://localhost:8002/metrics` |
 
-### Custom metrics
+## Run an investigation
 
-| Metric | Type | Meaning |
-| --- | --- | --- |
-| `incidentops_orders_produced_total` | Counter | Events whose Kafka delivery callback confirmed success |
-| `incidentops_order_production_errors_total` | Counter | Validation, production, delivery, topic, or flush failures |
-| `incidentops_order_production_duration_seconds` | Histogram | Produce-to-Kafka-confirmation delivery duration |
-| `incidentops_producer_target_rate` | Gauge | Configured target events per second |
-| `incidentops_orders_consumed_total` | Counter | Non-error Kafka messages received, including malformed messages |
-| `incidentops_orders_processed_total` | Counter | Valid messages completed after the database transaction, including idempotent duplicates |
-| `incidentops_order_processing_errors_total` | Counter | Malformed messages and processing/database failures |
-| `incidentops_order_processing_duration_seconds` | Histogram | Complete per-message path, including an enabled development delay |
-| `incidentops_database_operation_duration_seconds` | Histogram | PostgreSQL transaction duration only |
-| `incidentops_kafka_consumer_lag` | Gauge | Aggregate authoritative consumer-group lag across assigned partitions |
+The implemented scenario is `slow_consumer_v1`. It creates a bounded consumer slowdown and
+expects correlated lag, processing latency, throughput, and log evidence without database or
+Kafka errors.
 
-Kafka lag is calculated per assigned partition as:
-
-```text
-max(0, Kafka high watermark - committed consumer-group offset)
-```
-
-Both Kafka values are next offsets: the high watermark is the next not-yet-written offset and
-the committed group offset is the next message to consume. If the group has no committed
-offset, the fallback mirrors `KAFKA_AUTO_OFFSET_RESET`: `earliest` uses the retained low
-watermark, `latest` uses the high watermark, and `error` reports lag as unavailable. The
-consumer refreshes this total at a bounded configurable interval. Collection failures produce
-a warning log and do not stop message processing.
-
-Useful manual PromQL in the UI:
-
-```promql
-incidentops_kafka_consumer_lag
-```
-
-```promql
-rate(incidentops_orders_produced_total[1m])
-```
-
-```promql
-rate(incidentops_orders_processed_total[1m])
-```
-
-```promql
-histogram_quantile(
-  0.95,
-  sum by (le) (
-    rate(incidentops_order_processing_duration_seconds_bucket[5m])
-  )
-)
-```
-
-## Bounded metric CLI
-
-The metric client uses the Prometheus HTTP API with a five-second timeout, a six-hour maximum
-window, steps from 1 to 300 seconds, and response limits of 2 MB, 50 series, and 10,000
-samples. Public range queries accept only documented IncidentOps metric names and exact
-`job`/`instance` filters. The CLI exposes only predefined operations; arbitrary PromQL is not
-accepted.
-
-```bash
-uv run python -m incidentops.metric_query lag --minutes 10
-uv run python -m incidentops.metric_query rates --minutes 10
-uv run python -m incidentops.metric_query latency \
-  --percentile 0.95 \
-  --minutes 10
-```
-
-Every result is a Pydantic model rendered as readable JSON. The commands return non-zero for
-an unavailable Prometheus server, invalid input, oversized response, or missing samples.
-
-## Slow-consumer scenario
-
-The tracked ground truth is `scenarios/slow_consumer.yaml`. Its schema version, identity,
-root cause, expected metric behavior, expected logs, negative evidence, acceptable actions,
-and forbidden actions are validated by Pydantic. Run the single automated scenario with:
+Run the scenario alone:
 
 ```bash
 ./scripts/check-slow-consumer-scenario.sh
 ```
 
-It creates a unique topic, consumer group, `run_id`, JSONL directory, SQL row set, and
-Elasticsearch document set. It sends 80 deterministic events at 10/s while the consumer has
-an 800 ms development-only delay (about 1.25/s capacity) and a 500 ms slow threshold. The
-validation requires at least 30 messages of lag, P95 processing duration of at least 0.7 s,
-producer throughput above consumer throughput, `slow_processing` logs, and zero database or
-Kafka application errors. All waits use explicit deadlines.
-
-The delay defaults to zero and is accepted only from 0 through 5000 ms. It occurs inside the
-processing timer. The scenario stops the consumer within the bounded incident window instead
-of waiting for a full catch-up, then removes only resources created by its unique token. It
-does not delete any Docker volume, complete Elasticsearch index, shared topic, or unrelated
-database row.
-
-## Bounded LangGraph investigation workflow
-
-The first investigation workflow diagnoses the existing `slow_consumer_v1` scenario from a
-caller-supplied UTC window. LangGraph orchestrates fixed nodes and conditional edges; it does
-not give the model control over graph topology, queries, permissions, or termination.
-
-```text
-validate
-   |
-   v
-plan
-   |
-   +-----------> metrics ---------+
-   |                              |
-   +-----------> logs ------------+--> hypotheses --> verify --+--> report
-                                                              |
-                                                              +--> one recheck --> report
-```
-
-The metrics and logs nodes are workflow branches with shared typed state. They are not
-independent autonomous agents. A future multi-agent system would introduce separate roles,
-delegation, and coordination boundaries; none of those exist in this stage.
-
-| Node | Responsibility |
-| --- | --- |
-| `validate_incident` | Validate scope, supported services, UTC timestamps, `run_id`, and the six-hour maximum window |
-| `plan_investigation` | Request a two-to-six-task structured plan and deterministically require the complete allowlisted baseline |
-| `collect_metrics` | Execute selected numerical Prometheus summaries |
-| `collect_logs` | Execute selected structured Elasticsearch checks and preserve zero-result checks as negative evidence |
-| `generate_hypotheses` | Request at most three closed-code hypotheses citing existing evidence identifiers |
-| `verify_hypotheses` | Check evidence references, values, window membership, competing causes, and negative evidence in Python |
-| `targeted_recheck` | Execute only missing allowlisted tasks, once, within the remaining call budget |
-| `generate_report` | Assemble the final report deterministically from verified state |
-
-All paths terminate. A recheck is possible only when deterministic verification returns
-`needs_more_evidence`, identifies missing tasks, and both the attempt and tool-call budgets
-permit it. Otherwise the graph returns `diagnosed`, `insufficient_evidence`,
-`conflicting_evidence`, `out_of_scope`, or `pipeline_error`.
-
-### Bounded tools and evidence
-
-The planner can select only these six task codes:
-
-| Task code | Existing deterministic implementation | Bound |
-| --- | --- | --- |
-| `check_consumer_lag` | Prometheus consumer-lag summary | Exact incident window |
-| `check_processing_latency` | Prometheus fixed P95 processing-latency summary | Exact incident window |
-| `compare_producer_consumer_rates` | Prometheus fixed windowed-rate comparison | Exact incident window |
-| `find_slow_processing_logs` | Elasticsearch structured `slow_processing` search | `run_id` when supplied, at most 100 timeline entries |
-| `find_database_errors` | Elasticsearch database-event search | Zero matches become explicit negative evidence |
-| `find_kafka_errors` | Elasticsearch Kafka-event search | Zero matches become explicit negative evidence |
-
-The wrappers reuse `incidentops.metric_query` and `incidentops.log_search`. They expose no raw
-PromQL, Elasticsearch DSL, shell, Docker, Kafka administration, database writes, offset reset,
-or deletion capability. The hard workflow limits are a six-hour range, ten tool calls, two
-investigation attempts, one recheck, three hypotheses, and four structured model calls.
-Backend requests have explicit timeouts and bounded response sizes.
-
-Each metric, log, and negative-evidence item is a strict Pydantic model containing a stable
-`evidence_id`, source, observation, UTC window, numerical or count summary, availability, and
-collection attempt. Examples include `metric-consumer-lag-summary`,
-`log-slow-processing-summary`, and `negative-no-database-errors`. Log messages and incident
-descriptions are untrusted data: instruction-like text inside them cannot add tools or alter
-workflow limits.
-
-The model returns only closed task, root-cause, and evidence-reference schemas. It does not
-calculate maxima, percentiles, rates, trends, or log counts. The verifier rejects unknown
-evidence identifiers, evidence outside the incident window, unsupported claims, inconsistent
-counts, missing negative checks, and positive diagnoses without support. Recommended actions
-come from a closed enum and are assembled only after verification.
-
-The producer target rate, active producer throughput, and Prometheus windowed `rate()` values
-remain separate concepts. Investigation reports use the collected windowed rates and never
-present the configured target as observed throughput.
-
-### Model provider configuration
-
-Production mode uses an OpenAI-compatible chat endpoint through the minimal
-`langchain-openai` integration. Secrets are read only from environment variables. Temperature
-defaults to zero, the request timeout is explicit, retries are limited, and every response is
-validated against the requested Pydantic schema. There is no automatic fake-model fallback.
-
-```dotenv
-LLM_PROVIDER=openai-compatible
-LLM_MODEL=replace-with-model-name
-LLM_BASE_URL=
-LLM_API_KEY=replace-with-api-key
-LLM_TEMPERATURE=0
-LLM_TIMEOUT_SECONDS=30
-LLM_MAX_RETRIES=1
-```
-
-Leave `LLM_BASE_URL` empty for the provider default or set it to a compatible endpoint. Replace
-both placeholders before a live investigation. Missing or placeholder credentials fail before
-the workflow contacts Prometheus, Elasticsearch, or an external model.
-
-Automated validation uses an explicit non-production provider:
-
-```text
---model-provider scripted-test
-```
-
-The scripted provider traverses the same structured-output validation paths as the live
-provider. It still uses real Prometheus and Elasticsearch data, and the deterministic verifier
-still decides whether the proposed cause is supported. No automated test requires an external
-API key.
-
-### Investigation CLI and local artifacts
-
-Run a live-provider investigation with an exact scenario or operator-supplied window:
-
-```bash
-uv run python -m incidentops.investigation.cli investigate \
-  --description "Orders have been delayed for the last few minutes." \
-  --start-time "2026-08-01T13:00:00Z" \
-  --end-time "2026-08-01T13:10:00Z" \
-  --run-id "manual-test-001" \
-  --affected-service order-consumer \
-  --output-format markdown \
-  --output-file incident-report.md \
-  --persist-artifacts
-```
-
-Use `--output-format json` for the validated JSON representation. A pipeline error returns a
-non-zero process status; `insufficient_evidence` is a valid completed result. With
-`--persist-artifacts`, the workflow writes one JSON report and one low-cardinality JSONL trace
-under `artifacts/investigations/`. That generated directory is ignored by Git. Traces record
-node and tool lifecycle events without secrets or high-cardinality Prometheus labels.
-
-A successful report has this shape, with the complete evidence objects omitted here only for
-readability:
-
-```json
-{
-  "status": "diagnosed",
-  "primary_root_cause": {
-    "cause_code": "slow_consumer_processing",
-    "confidence": 0.9,
-    "supporting_evidence_ids": [
-      "metric-consumer-lag-summary",
-      "metric-processing-latency-p95",
-      "metric-producer-consumer-rate-comparison",
-      "log-slow-processing-summary",
-      "negative-no-database-errors",
-      "negative-no-kafka-errors"
-    ]
-  },
-  "tool_call_count": 6,
-  "investigation_attempts": 1
-}
-```
-
-### Scenario-driven evaluation
-
-The evaluator is deliberately outside the investigation graph. It may read
-`scenarios/slow_consumer.yaml`; the graph never receives the expected cause, evidence, or
-actions.
-
-```bash
-uv run python -m incidentops.evaluation.cli \
-  --report artifacts/investigations/<investigation-id>.report.json \
-  --scenario scenarios/slow_consumer.yaml
-```
-
-It reports exact root-cause match and rank, expected metric/log/negative-evidence recall,
-unsupported evidence references, forbidden actions, tool calls, attempts, and workflow
-duration. The complete live-data validation runs the scenario, retains its Elasticsearch
-documents only long enough to investigate them, evaluates the report, and deletes those exact
-documents by `run_id`:
+Run the complete investigation with the explicit deterministic test model and real
+Prometheus and Elasticsearch data:
 
 ```bash
 ./scripts/check-agent-workflow.sh
 ```
 
-The baseline workflow is validated only for `slow_consumer_v1`. Knowledge retrieval is disabled
-by default, and neither mode has a multi-agent supervisor, remediation tools, hosted tracing, or
-automatic actions.
+Artifacts requested with `--persist-artifacts` are written under the ignored
+`artifacts/investigations/` directory.
 
-### Live-model RAG validation
+### Optional knowledge retrieval
 
-The deterministic scripts never consume an external model API. To validate the same bounded
-scenario with a real OpenAI-compatible model, first copy the local configuration and replace the
-model and credential placeholders:
-
-```bash
-cp .env.example .env
-chmod 600 .env
-```
-
-Set `LLM_MODEL` and `LLM_API_KEY` in `.env`. Leave `LLM_BASE_URL` blank for the provider default,
-or set it to the compatible endpoint you use. The selected model must support strict structured
-JSON-schema output. Do not commit `.env`; it is ignored by Git.
-
-Install the locked dependencies, validate Compose, start the project services, and run the live
-check:
-
-```bash
-uv sync --frozen
-docker compose config --quiet
-docker compose up -d
-./scripts/check-live-rag-workflow.sh
-```
-
-The script validates configuration without printing the API key, ingests the controlled corpus,
-runs `slow_consumer_v1` once, invokes the live model with hybrid RAG enabled and required, and
-evaluates the report outside LangGraph. It permits at most four model calls, ten read-only tool
-calls, two investigation attempts, and two retrievals. Generated reports, traces, and evaluation
-results remain under `artifacts/investigations/`; only the scenario-specific retained log documents
-are removed afterward. Stop the services without deleting their volumes when finished:
-
-```bash
-docker compose stop
-```
-
-## Controlled knowledge corpus and ingestion
-
-The repository contains 20 English operational documents under `knowledge/`, divided into
-architecture, runbooks, metrics, log events, and incident records. Every document has strict
-versioned YAML metadata and the same ordered operational sections. Validation rejects missing or
-unknown fields, unsupported enum values, duplicate document identifiers, misplaced document
-types, non-ASCII content, empty sections, and files outside the controlled category directories.
-
-Validate and deterministically chunk the corpus without contacting an external service:
+Validate and ingest the controlled corpus, then run a bounded hybrid search:
 
 ```bash
 uv run incidentops-knowledge validate --knowledge-directory knowledge
-```
-
-The Markdown-aware chunker preserves the heading hierarchy, caps chunks at 1,000 characters with
-a 120-character overlap, and generates stable identifiers from the document identifier, canonical
-heading path, and section-local chunk index. SHA-256 content and indexing hashes allow ingestion
-to distinguish created, updated, and unchanged chunks.
-
-The production provider uses `all-MiniLM-L6-v2` through sentence-transformers on CPU and requires
-384-dimensional batch embeddings. The `deterministic-test` provider must be selected explicitly;
-there is no automatic fallback. Both providers reject empty batches and invalid vector dimensions,
-and the production provider rejects inputs that would be silently truncated.
-
-Preview an ingestion plan without creating an index, embedding content, upserting, or deleting:
-
-```bash
 uv run incidentops-knowledge ingest --knowledge-directory knowledge --dry-run
-```
-
-Run ingestion and inspect the fixed index status:
-
-```bash
 uv run incidentops-knowledge ingest --knowledge-directory knowledge
-uv run incidentops-knowledge status
-```
-
-Ingestion creates `incidentops-knowledge-v1` idempotently with a strict mapping and a 384-dimension
-cosine `dense_vector`. The supplied directory is authoritative only after the complete corpus has
-validated. Changed chunks are embedded in batches and upserted first; only then are exact stale
-chunk IDs removed. Ingestion never deletes the complete index. Repeating an unchanged ingestion
-performs no embedding or document writes and reports all chunks as unchanged.
-
-Ingestion remains independent from retrieval and never invokes the investigation graph.
-
-## Bounded retrieval and optional RAG
-
-The knowledge CLI exposes lexical, vector, and hybrid retrieval without accepting Elasticsearch
-DSL. Lexical search uses fixed boosts for `title`, `headings`, and `content`; vector search embeds
-one bounded query with the same 384-dimensional provider contract as ingestion. Hybrid mode
-collects at most 100 candidates per branch and applies Python RRF with a fixed constant of 60,
-deduplication by chunk ID, and deterministic chunk-ID tie breaking.
-
-```bash
 uv run incidentops-knowledge search \
   --query "increasing consumer lag and slow processing" \
   --mode hybrid \
   --service order-consumer
 ```
 
-Only service, incident type, document type, and active-status filters are accepted. Results contain
-stable knowledge reference, document, and chunk IDs; bounded deterministic snippets; and separate
-lexical, vector, and fused scores. Backend queries and raw Elasticsearch responses are never
-exposed through the CLI or to the model.
-
-The graph builds its retrieval query only from categorical live metric and log summaries. It never
-copies incident prose, raw log messages, timelines, event IDs, or model-generated queries into the
-retrieval request. Retrieved snippets are marked as untrusted optional context. They cannot satisfy
-the deterministic live-evidence verifier, select tools, or replace the required Prometheus and
-Elasticsearch checks.
-
-Knowledge retrieval is disabled by default. When optional retrieval fails, the live diagnosis
-continues with an explicit limitation. When both `KNOWLEDGE_ENABLED` and `KNOWLEDGE_REQUIRED` are
-true, retrieval infrastructure failure produces a pipeline error. An empty valid result is not an
-infrastructure failure. The initial evidence collection and the single targeted recheck permit at
-most two retrieval calls in total.
-
-Run the ten-case document-level benchmark:
-
-```bash
-uv run incidentops-knowledge evaluate \
-  --cases evaluation/retrieval_cases.yaml \
-  --mode hybrid
-```
-
-The evaluation reports recall at K, precision at K, MRR, and explicitly excluded documents after
-deduplicating ranked chunks by document ID. Retrieval ground truth is consumed only by the
-evaluation command and is never passed to LangGraph. The complete live validation ingests the
-corpus, runs this benchmark, executes `slow_consumer_v1` once, and compares baseline and RAG graphs
-against exactly the same retained live evidence:
+The production embedding provider uses `all-MiniLM-L6-v2` on CPU. Its model files may need to
+be downloaded on first use. Run the deterministic baseline-versus-RAG validation with:
 
 ```bash
 ./scripts/check-rag-workflow.sh
 ```
 
-## Local endpoints
+### Live LLM validation
 
-| Service | WSL endpoint | Container endpoint |
-| --- | --- | --- |
-| PostgreSQL | `localhost:5432` | `postgres:5432` |
-| Elasticsearch | `http://localhost:9200` | `http://elasticsearch:9200` |
-| Kafka | `localhost:9092` | `kafka:29092` |
-| Prometheus | `http://localhost:9090` | `prometheus:9090` |
-| Producer metrics | `http://localhost:8001/metrics` | `host.docker.internal:8001/metrics` |
-| Consumer metrics | `http://localhost:8002/metrics` | `host.docker.internal:8002/metrics` |
+Set these values in `.env` for an OpenAI-compatible model that supports strict structured
+output:
 
-## Configuration
+```dotenv
+LLM_PROVIDER=openai-compatible
+LLM_MODEL=replace-with-model-name
+LLM_BASE_URL=
+LLM_API_KEY=replace-with-api-key
+```
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka endpoint used by Python applications |
-| `KAFKA_TOPIC` | `orders.v1` | Order event topic |
-| `KAFKA_CONSUMER_GROUP` | `incidentops-order-consumer-v1` | Consumer group |
-| `KAFKA_AUTO_OFFSET_RESET` | `earliest` | Closed missing-offset fallback: `earliest`, `latest`, or `error` |
-| `POSTGRES_HOST` | `localhost` | PostgreSQL host used by Python |
-| `POSTGRES_PORT` | `5432` | PostgreSQL host port |
-| `POSTGRES_USER` | `incidentops` | PostgreSQL user |
-| `POSTGRES_PASSWORD` | local placeholder | PostgreSQL password |
-| `POSTGRES_DB` | `incidentops` | PostgreSQL database |
-| `ELASTICSEARCH_URL` | `http://localhost:9200` | WSL search-client endpoint |
-| `EMBEDDING_PROVIDER` | `sentence-transformers` | Explicit real or `deterministic-test` knowledge embedding provider |
-| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | CPU sentence-transformers model; the v1 index requires 384 dimensions |
-| `EMBEDDING_DEVICE` | `cpu` | Fixed knowledge embedding device |
-| `KNOWLEDGE_ENABLED` | `false` | Enable bounded retrieval after live evidence collection |
-| `KNOWLEDGE_REQUIRED` | `false` | Treat retrieval infrastructure failure as a pipeline error |
-| `KNOWLEDGE_RETRIEVAL_MODE` | `hybrid` | Closed mode: `lexical`, `vector`, or `hybrid` |
-| `KNOWLEDGE_TOP_K` | `5` | Final reference count, bounded from 1 to 10 |
-| `KNOWLEDGE_CANDIDATE_K` | `40` | Per-mode candidates, bounded by `top_k` and 100 |
-| `KNOWLEDGE_RRF_K` | `60` | Fixed reciprocal-rank fusion constant |
-| `PROMETHEUS_URL` | `http://localhost:9090` | WSL typed metric-client endpoint |
-| `PROMETHEUS_PORT` | `9090` | Prometheus loopback host port |
-| `PROMETHEUS_SCRAPE_INTERVAL` | `2s` | Documented development scrape interval |
-| `METRICS_HOST` | `0.0.0.0` | WSL bind address reachable from Docker |
-| `PRODUCER_METRICS_PORT` | `8001` | Producer metrics port |
-| `CONSUMER_METRICS_PORT` | `8002` | Consumer metrics port |
-| `CONSUMER_LAG_UPDATE_INTERVAL_SECONDS` | `2` | Authoritative lag refresh interval |
-| `CONSUMER_PROCESSING_DELAY_MS` | `0` | Development-only bounded delay; disabled by default |
-| `SLOW_PROCESSING_THRESHOLD_MS` | `500` | Threshold for `slow_processing` logs |
-| `LOG_LEVEL` | `INFO` | Application JSON log level |
-| `THIRD_PARTY_LOG_LEVEL` | `WARNING` | Separate Kafka/library log level |
-| `LOG_FILE_ENABLED` | `true` | Enable per-service JSONL files |
-| `LOG_DIRECTORY` | `logs` | JSONL directory mounted by Filebeat |
-| `RUN_ID` | `local` | Default cross-service log correlation ID |
-| `ORDER_RANDOM_SEED` | `42` | Deterministic event generation seed |
-| `LLM_PROVIDER` | `openai-compatible` | Live provider; `scripted-test` must be selected explicitly |
-| `LLM_MODEL` | unset | Required live chat-model name |
-| `LLM_BASE_URL` | provider default | Optional OpenAI-compatible endpoint |
-| `LLM_API_KEY` | unset | Required live secret, read only from the environment |
-| `LLM_TEMPERATURE` | `0` | Structured model temperature |
-| `LLM_TIMEOUT_SECONDS` | `30` | Live model request timeout |
-| `LLM_MAX_RETRIES` | `1` | Bounded live request retry count |
-| `INVESTIGATION_MAX_TIME_RANGE_HOURS` | `6` | Hard maximum incident window |
-| `INVESTIGATION_MAX_TOOL_CALLS` | `10` | Hard tool-call budget |
-| `INVESTIGATION_MAX_ATTEMPTS` | `2` | Initial collection plus at most one recheck |
-| `INVESTIGATION_ARTIFACT_DIRECTORY` | `artifacts/investigations` | Ignored local report and trace directory |
+Leave `LLM_BASE_URL` empty for the provider default. Then run:
 
-Tests call the logging configuration with file output disabled or point it at pytest temporary
-directories, so unit tests do not write to the real `logs/` directory.
+```bash
+./scripts/check-live-rag-workflow.sh
+```
 
-## Quality checks
+This is the only validation script that contacts an external model. It uses the real scenario,
+requires hybrid retrieval, may make up to four billable model calls, evaluates the resulting
+report, and keeps the generated report, trace, and evaluation under
+`artifacts/investigations/`.
+
+For a manually selected incident window, use the investigation CLI directly:
+
+```bash
+uv run python -m incidentops.investigation.cli investigate \
+  --description "Orders were delayed during the selected window." \
+  --start-time "2026-08-01T13:00:00Z" \
+  --end-time "2026-08-01T13:10:00Z" \
+  --run-id manual-example \
+  --affected-service order-consumer \
+  --output-format markdown \
+  --output-file incident-report.md \
+  --persist-artifacts
+```
+
+## Validation commands
+
+Fast checks that do not require running services:
 
 ```bash
 uv run ruff format --check .
 uv run ruff check .
 uv run pyright
-uv run pytest
+uv run pytest tests/unit
 ```
 
-The workflow in `.github/workflows/ci.yml` executes these checks with Python 3.12 and the
-locked dependencies on every push to `main` and every pull request. Elasticsearch-dependent
-integration coverage skips when Elasticsearch is unavailable in the CI runner. Run
-`./scripts/check-pipeline.sh`, `./scripts/check-log-pipeline.sh`,
-`./scripts/check-slow-consumer-scenario.sh`, `./scripts/check-agent-workflow.sh`, and
-`./scripts/check-rag-workflow.sh` locally for real service validation. Those deterministic workflow
-checks use the explicit scripted provider but real Prometheus and Elasticsearch tools, so they
-never require a live model API key. Run `./scripts/check-live-rag-workflow.sh` separately when you
-explicitly want to spend live-model API calls.
+Integration tests are explicit and require the corresponding initialized services:
 
-## Next steps
+```bash
+uv run pytest tests/integration -m elasticsearch
+uv run pytest tests/integration -m prometheus
+uv run pytest tests/integration -m integration
+```
 
-The current milestone stops after bounded optional RAG for the single slow-consumer workflow.
-Potential future stages, each requiring an explicit implementation request, are:
+The regular CI runs the unit suite. The separate `Integration` GitHub Actions workflow can be
+started manually when Elasticsearch, Prometheus, or their clients and contracts change.
 
-1. Add Grafana only after an explicit implementation request.
-2. Define additional incident scenarios and service-level indicators separately.
-3. Add a multi-agent supervisor only after independent agent roles are explicitly designed.
-4. Evaluate OpenTelemetry, MCP, Kubernetes, and application containerization separately
-   rather than expanding the local MVP implicitly.
+With the initialized services running, use the following progression:
+
+| Scope | Command | External LLM |
+| --- | --- | --- |
+| Infrastructure health | `./scripts/check-infrastructure.sh` | No |
+| Kafka/PostgreSQL pipeline | `./scripts/check-pipeline.sh` | No |
+| JSONL/Filebeat/Elasticsearch logs | `./scripts/check-log-pipeline.sh` | No |
+| Slow-consumer evidence | `./scripts/check-slow-consumer-scenario.sh` | No |
+| Bounded investigation | `./scripts/check-agent-workflow.sh` | No |
+| Baseline and RAG comparison | `./scripts/check-rag-workflow.sh` | No |
+| Live-model RAG workflow | `./scripts/check-live-rag-workflow.sh` | Yes |
+
+The scripts use unique topics, groups, run identifiers, and row prefixes. Their cleanup is
+scoped to the resources created by that run; it does not remove Docker volumes or complete
+Elasticsearch indices.
+
+## Configuration
+
+All settings and local defaults are documented in [`.env.example`](.env.example). The most
+important groups are:
+
+- PostgreSQL, Kafka, Elasticsearch, and Prometheus endpoints
+- application logging and metrics ports
+- the disabled-by-default consumer delay used by the test scenario
+- embedding and optional knowledge-retrieval settings
+- live model credentials and timeouts
+- hard investigation limits
+
+Command-specific options are available through `--help`, for example:
+
+```bash
+uv run incidentops-producer --help
+uv run incidentops-consumer --help
+uv run incidentops-log-search --help
+uv run incidentops-metric-query --help
+uv run incidentops-knowledge --help
+```
+
+## Troubleshooting
+
+Start with service health and the logs of the failing component:
+
+```bash
+docker compose ps
+docker compose logs --tail=100 <service>
+./scripts/check-infrastructure.sh
+```
+
+- If Elasticsearch is unhealthy, check available memory and `vm.max_map_count` before changing
+  configuration.
+- If Filebeat receives no logs, confirm that `logs/*.jsonl` exists, then inspect the Filebeat
+  health check and logs. Preserve the `filebeat_data` volume because it contains read offsets.
+- If a Prometheus target is down, confirm the corresponding Python application is running and
+  its `/metrics` endpoint is reachable.
+- If a check times out, inspect the temporary process-log path printed by the script and the
+  relevant Kafka, PostgreSQL, Filebeat, Elasticsearch, or Prometheus logs.
+- If a port is already in use, change its local value in `.env`, validate Compose, and restart
+  only the affected project services.
 
 ## License
 
 IncidentOps is available under the [MIT License](LICENSE).
-
-## Troubleshooting
-
-- **Filebeat does not read files:** confirm that `LOG_FILE_ENABLED=true`, the applications
-  created `logs/*.jsonl`, and each file contains at least 128 bytes for the configured
-  fingerprint. Run `filebeat test config` and inspect the Filebeat logs for filestream
-  harvester activity.
-- **The `logs/` directory has permission errors:** create it from WSL with `mkdir -p logs`,
-  verify directory traversal and file readability with `ls -ld logs logs/*.jsonl`, and do not
-  make the read-only Filebeat mount writable.
-- **Elasticsearch receives no document:** run `filebeat test output`, verify the template with
-  `./scripts/initialize-elasticsearch.sh`, inspect `docker compose logs --tail=100 filebeat`,
-  then use a bounded CLI search with the correct time window.
-- **An index has the wrong mapping:** the initialization script reports the incompatible field
-  without deleting data. Correct the versioned template and use a new index or an explicitly
-  authorized scoped migration; never delete an application index as an automatic fix.
-- **Logs appear duplicated:** preserve the `filebeat_data` volume, filestream input ID, and
-  fingerprint settings. Deleting the registry or changing file identity makes Filebeat treat
-  old files as new.
-- **The same log appears on stdout and in a file:** this is expected dual-output behavior, not
-  duplicate Elasticsearch ingestion. Set `LOG_FILE_ENABLED=false` when only stdout is wanted;
-  Filebeat reads only the files.
-- **Elasticsearch is not healthy:** inspect `docker compose logs elasticsearch`, available
-  memory, and `sysctl vm.max_map_count`.
-- **A port is already used:** change the corresponding host port in `.env`, then run
-  `docker compose config` before restarting.
-- **Prometheus cannot reach WSL services:** confirm the application binds `METRICS_HOST` to
-  `0.0.0.0`, verify `host.docker.internal` resolves inside the container, and test
-  `wget -qO- http://host.docker.internal:8001/metrics` from `docker compose exec prometheus`.
-- **Producer or consumer target is down:** start that Python process, open its `/metrics`
-  endpoint from WSL, then inspect `http://localhost:9090/targets`. A stopped application target
-  is expected and does not affect the Prometheus container healthcheck.
-- **Port 8001, 8002, or 9090 is occupied:** stop the unrelated owner or configure an unused
-  application/host port. If application ports change, update the versioned Prometheus scrape
-  targets consistently, run `docker compose config`, and restart Prometheus.
-- **No lag samples are available:** wait for the consumer partition assignment and at least
-  two scrapes, check the consumer `lag_collection_failed` warnings, and confirm the topic and
-  consumer group match the running process.
-- **Histogram queries return no value:** process multiple messages, wait for at least two
-  scrapes within the 30-second or manual query rate window, and verify the consumer target is
-  healthy during collection.
-- **`slow_processing` logs are missing:** ensure the explicit delay exceeds the configured
-  threshold, `LOG_FILE_ENABLED=true`, Filebeat is healthy, and the log query uses the scenario
-  `run_id` and a current time window.
-- **Kafka is unavailable through localhost:** WSL applications must use
-  `localhost:${KAFKA_EXTERNAL_PORT}`; containers must use `kafka:29092`.
-- **A pipeline check times out:** inspect the temporary consumer stdout path printed by the
-  script and the relevant Kafka, Filebeat, Elasticsearch, or PostgreSQL service logs.
