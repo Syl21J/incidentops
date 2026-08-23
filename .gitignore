@@ -25,6 +25,7 @@ logs/
 
 # Generated local investigation reports and traces
 artifacts/investigations/
+artifacts/benchmarks/
 
 # Editors and operating systems
 .idea/

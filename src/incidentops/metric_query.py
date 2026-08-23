@@ -41,6 +41,11 @@ MAX_RESPONSE_BYTES = 2_000_000
 MAX_SERIES = 50
 MAX_SAMPLES = 10_000
 DEFAULT_TIMEOUT_SECONDS = 5.0
+ELEVATED_PROCESSING_SECONDS = 0.5
+ELEVATED_DATABASE_SECONDS = 0.5
+PRODUCER_SURGE_RATIO = 3.0
+PRODUCER_SURGE_RATE_DELTA = 5.0
+PRESENT_RATE_EPSILON = 0.001
 
 
 class MetricQueryError(RuntimeError):
@@ -141,7 +146,7 @@ class ConsumerLagSummary(BaseModel):
 
 
 class ProcessingLatencySummary(BaseModel):
-    """A safe histogram percentile result."""
+    """Safe processing and database histogram percentiles over one window."""
 
     metric: Literal["incidentops_order_processing_duration_seconds"] = (
         "incidentops_order_processing_duration_seconds"
@@ -151,10 +156,14 @@ class ProcessingLatencySummary(BaseModel):
     end: AwareDatetime
     sample_count: int = Field(gt=0)
     duration_seconds: float = Field(ge=0)
+    database_sample_count: int = Field(default=0, ge=0)
+    database_duration_seconds: float = Field(default=0.0, ge=0)
+    processing_state: Literal["normal", "elevated"] = "normal"
+    database_state: Literal["normal", "elevated"] = "normal"
 
 
 class RateComparison(BaseModel):
-    """Producer and successful consumer rates over the same interval."""
+    """Observed throughput, producer change, and consumer health summaries."""
 
     start: AwareDatetime
     end: AwareDatetime
@@ -162,6 +171,13 @@ class RateComparison(BaseModel):
     consumer_rate: float = Field(ge=0)
     rate_difference: float
     consumer_is_slower: bool
+    producer_baseline_rate: float = Field(default=0.0, ge=0)
+    producer_recent_rate: float = Field(default=0.0, ge=0)
+    producer_rate_change_ratio: float = Field(default=1.0, ge=0)
+    producer_surge: bool = False
+    processing_error_rate: float = Field(default=0.0, ge=0)
+    processing_errors_present: bool = False
+    valid_processing_present: bool = True
 
 
 def _selector(metric: str, labels: Mapping[str, str]) -> str:
@@ -411,26 +427,48 @@ def get_processing_latency_summary(
         end=end,
         step_seconds=step_seconds,
     )
-    expression = (
+    processing_expression = (
         f"histogram_quantile({percentile}, sum by (le) "
         "(rate(incidentops_order_processing_duration_seconds_bucket[30s])))"
     )
-    samples = _summed_samples(
+    database_expression = (
+        f"histogram_quantile({percentile}, sum by (le) "
+        "(rate(incidentops_database_operation_duration_seconds_bucket[30s])))"
+    )
+    processing_samples = _summed_samples(
         client._range_expression(
-            expression,
+            processing_expression,
             start=start,
             end=end,
             step_seconds=step_seconds,
         )
     )
-    if not samples:
+    database_samples = _summed_samples(
+        client._range_expression(
+            database_expression,
+            start=start,
+            end=end,
+            step_seconds=step_seconds,
+        )
+    )
+    if not processing_samples:
         raise MetricQueryError("no processing latency samples are available")
+    if not database_samples:
+        raise MetricQueryError("no database latency samples are available")
+    processing_duration = max(0.0, processing_samples[-1].value)
+    database_duration = max(0.0, database_samples[-1].value)
     return ProcessingLatencySummary(
         percentile=percentile,
         start=start,
         end=end,
-        sample_count=len(samples),
-        duration_seconds=samples[-1].value,
+        sample_count=len(processing_samples),
+        duration_seconds=processing_duration,
+        database_sample_count=len(database_samples),
+        database_duration_seconds=database_duration,
+        processing_state=(
+            "elevated" if processing_duration >= ELEVATED_PROCESSING_SECONDS else "normal"
+        ),
+        database_state=("elevated" if database_duration >= ELEVATED_DATABASE_SECONDS else "normal"),
     )
 
 
@@ -439,6 +477,21 @@ def _mean_sample_value(series: list[MetricSeries], name: str) -> float:
     if not samples:
         raise MetricQueryError(f"no {name} rate samples are available")
     return sum(sample.value for sample in samples) / len(samples)
+
+
+def _producer_rate_change(series: list[MetricSeries]) -> tuple[float, float, float, bool]:
+    """Compare early and late observed producer rates without using target configuration."""
+
+    samples = _summed_samples(series)
+    if not samples:
+        raise MetricQueryError("no producer rate samples are available")
+    values = [max(0.0, sample.value) for sample in samples]
+    segment_size = max(1, len(values) // 3)
+    baseline = sum(values[:segment_size]) / segment_size
+    recent = sum(values[-segment_size:]) / segment_size
+    ratio = recent / baseline if baseline > PRESENT_RATE_EPSILON else 1.0
+    surge = ratio >= PRODUCER_SURGE_RATIO and recent - baseline >= PRODUCER_SURGE_RATE_DELTA
+    return baseline, recent, ratio, surge
 
 
 def compare_production_and_processing_rates(
@@ -456,23 +509,29 @@ def compare_production_and_processing_rates(
         end=end,
         step_seconds=step_seconds,
     )
-    producer_rate = _mean_sample_value(
-        client._range_expression(
-            "rate(incidentops_orders_produced_total[30s])",
-            start=start,
-            end=end,
-            step_seconds=step_seconds,
-        ),
-        "producer",
+    producer_series = client._range_expression(
+        "rate(incidentops_orders_produced_total[10s])",
+        start=start,
+        end=end,
+        step_seconds=step_seconds,
     )
-    consumer_rate = _mean_sample_value(
-        client._range_expression(
-            "rate(incidentops_orders_processed_total[30s])",
-            start=start,
-            end=end,
-            step_seconds=step_seconds,
-        ),
-        "consumer",
+    consumer_series = client._range_expression(
+        "rate(incidentops_orders_processed_total[10s])",
+        start=start,
+        end=end,
+        step_seconds=step_seconds,
+    )
+    error_series = client._range_expression(
+        "rate(incidentops_order_processing_errors_total[10s])",
+        start=start,
+        end=end,
+        step_seconds=step_seconds,
+    )
+    producer_rate = _mean_sample_value(producer_series, "producer")
+    consumer_rate = _mean_sample_value(consumer_series, "consumer")
+    processing_error_rate = _mean_sample_value(error_series, "processing error")
+    baseline_rate, recent_rate, rate_change_ratio, producer_surge = _producer_rate_change(
+        producer_series
     )
     difference = producer_rate - consumer_rate
     return RateComparison(
@@ -482,6 +541,13 @@ def compare_production_and_processing_rates(
         consumer_rate=max(0.0, consumer_rate),
         rate_difference=difference,
         consumer_is_slower=difference > 0,
+        producer_baseline_rate=baseline_rate,
+        producer_recent_rate=recent_rate,
+        producer_rate_change_ratio=rate_change_ratio,
+        producer_surge=producer_surge,
+        processing_error_rate=max(0.0, processing_error_rate),
+        processing_errors_present=processing_error_rate > PRESENT_RATE_EPSILON,
+        valid_processing_present=consumer_rate > PRESENT_RATE_EPSILON,
     )
 
 

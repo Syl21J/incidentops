@@ -16,6 +16,7 @@ from incidentops.metric_query import (
     RangeQueryParams,
     calculate_trend,
     compare_production_and_processing_rates,
+    get_processing_latency_summary,
 )
 
 NOW = datetime(2026, 8, 1, 10, 0, tzinfo=UTC)
@@ -51,6 +52,62 @@ class RateClient(PrometheusClient):
         del end, step_seconds
         value = 20.0 if "produced" in expression else 1.25
         return [MetricSeries(labels={}, samples=[MetricSample(timestamp=start, value=value)])]
+
+
+class TrafficRateClient(PrometheusClient):
+    """Return an observed producer surge and a healthy processing stream."""
+
+    def __init__(self) -> None:
+        super().__init__("http://prometheus.test")
+
+    def _range_expression(
+        self,
+        expression: str,
+        *,
+        start: datetime,
+        end: datetime,
+        step_seconds: int,
+    ) -> list[MetricSeries]:
+        del end, step_seconds
+        if "orders_produced" in expression:
+            values = [2.0, 2.0, 2.0, 20.0, 20.0, 20.0]
+        elif "processing_errors" in expression:
+            values = [0.0] * 6
+        else:
+            values = [5.0] * 6
+        return [
+            MetricSeries(
+                labels={},
+                samples=[
+                    MetricSample(timestamp=start + timedelta(seconds=index * 2), value=value)
+                    for index, value in enumerate(values)
+                ],
+            )
+        ]
+
+
+class LatencyProfileClient(PrometheusClient):
+    """Return separate processing and database quantile samples."""
+
+    def __init__(self) -> None:
+        super().__init__("http://prometheus.test")
+
+    def _range_expression(
+        self,
+        expression: str,
+        *,
+        start: datetime,
+        end: datetime,
+        step_seconds: int,
+    ) -> list[MetricSeries]:
+        del end, step_seconds
+        value = 0.8 if "database_operation" in expression else 0.9
+        return [
+            MetricSeries(
+                labels={},
+                samples=[MetricSample(timestamp=start, value=value)],
+            )
+        ]
 
 
 def test_query_builds_only_exact_allowlisted_selector() -> None:
@@ -167,3 +224,32 @@ def test_rate_comparison_uses_predefined_queries() -> None:
     assert comparison.consumer_rate == 1.25
     assert comparison.rate_difference == 18.75
     assert comparison.consumer_is_slower is True
+
+
+def test_traffic_spike_is_derived_from_observed_producer_counter_rates() -> None:
+    comparison = compare_production_and_processing_rates(
+        TrafficRateClient(),
+        start=NOW - timedelta(minutes=1),
+        end=NOW,
+    )
+
+    assert comparison.producer_baseline_rate == 2
+    assert comparison.producer_recent_rate == 20
+    assert comparison.producer_rate_change_ratio == 10
+    assert comparison.producer_surge is True
+    assert comparison.processing_errors_present is False
+    assert comparison.valid_processing_present is True
+
+
+def test_processing_profile_distinguishes_database_operation_latency() -> None:
+    summary = get_processing_latency_summary(
+        LatencyProfileClient(),
+        percentile=0.95,
+        start=NOW - timedelta(minutes=1),
+        end=NOW,
+    )
+
+    assert summary.processing_state == "elevated"
+    assert summary.database_state == "elevated"
+    assert summary.duration_seconds == 0.9
+    assert summary.database_duration_seconds == 0.8

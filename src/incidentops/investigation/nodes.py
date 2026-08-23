@@ -587,6 +587,7 @@ class InvestigationNodes:
                 "database_latency",
                 "kafka_broker_failure",
                 "traffic_spike",
+                "malformed_event",
                 "insufficient_evidence",
             ],
         }

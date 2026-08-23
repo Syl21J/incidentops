@@ -168,6 +168,44 @@ def test_instruction_like_log_text_is_never_returned_to_model_facing_evidence(
     assert "shell command" not in serialized
 
 
+def test_application_log_tool_returns_bounded_category_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = [
+        LogEntry.model_validate(
+            {
+                "@timestamp": START + timedelta(seconds=index),
+                "level": "WARNING",
+                "service": "order-consumer",
+                "event_type": event_type,
+                "message": "Sanitized structured signal.",
+                "logger": "order-consumer",
+                "run_id": "run-001",
+            }
+        )
+        for index, event_type in enumerate(
+            ("slow_processing", "database_operation_slow", "invalid_event_skipped")
+        )
+    ]
+
+    def fake_search(_client: object, params: LogSearchParams) -> LogSearchResult:
+        assert set(params.event_types) == {
+            "slow_processing",
+            "database_operation_slow",
+            "invalid_event_skipped",
+        }
+        assert params.limit == 100
+        return LogSearchResult(total=3, logs=entries)
+
+    monkeypatch.setattr("incidentops.investigation.tools.search_logs", fake_search)
+
+    result = toolset().execute(InvestigationTaskType.FIND_SLOW_PROCESSING_LOGS, tool_input())
+
+    assert result.raw_value_summary["slow_processing_count"] == 1
+    assert result.raw_value_summary["database_operation_slow_count"] == 1
+    assert result.raw_value_summary["invalid_event_count"] == 1
+
+
 def test_structured_langchain_tool_invocation_uses_the_same_validated_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,12 +1,14 @@
 """Command-line producer for deterministic order events."""
 
 import argparse
+import json
 import logging
 import re
 import signal
 import sys
 import time
 from dataclasses import dataclass
+from functools import partial
 from threading import Event
 from types import FrameType
 
@@ -30,6 +32,16 @@ class DeliverySummary:
 
     sent: int = 0
     failed: int = 0
+    malformed_sent: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionPhase:
+    """One observed production-rate phase executed by the same process."""
+
+    name: str
+    count: int
+    rate: float
 
 
 def non_negative_integer(value: str) -> int:
@@ -47,6 +59,15 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def non_negative_float(value: str) -> float:
+    """Parse a non-negative bounded grace duration."""
+
+    parsed = float(value)
+    if not 0 <= parsed <= 15:
+        raise argparse.ArgumentTypeError("value must be between zero and 15")
     return parsed
 
 
@@ -109,6 +130,16 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Produce validated order events to Kafka.")
     parser.add_argument("--count", type=non_negative_integer, default=1)
     parser.add_argument("--rate", type=positive_float, default=1.0)
+    parser.add_argument(
+        "--malformed-count",
+        type=non_negative_integer,
+        default=0,
+        help="Scenario-only count of deterministic invalid payloads mixed into the batch.",
+    )
+    parser.add_argument("--baseline-count", type=non_negative_integer)
+    parser.add_argument("--baseline-rate", type=positive_float)
+    parser.add_argument("--burst-count", type=non_negative_integer)
+    parser.add_argument("--burst-rate", type=positive_float)
     parser.add_argument("--seed", type=int, default=settings.order_random_seed)
     parser.add_argument("--run-id", type=valid_run_id, default=settings.run_id)
     parser.add_argument("--schema-version", default="1.0")
@@ -126,7 +157,76 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         default=settings.metrics_enabled,
         help="Disable the Prometheus endpoint (primarily for isolated tests).",
     )
+    parser.add_argument(
+        "--metrics-grace-seconds",
+        type=non_negative_float,
+        default=0.0,
+        help="Keep the metrics endpoint alive briefly for a final bounded scrape.",
+    )
     return parser
+
+
+def production_phases(arguments: argparse.Namespace) -> list[ProductionPhase]:
+    """Validate and return either one normal phase or a baseline/burst schedule."""
+
+    scheduled_values = (
+        getattr(arguments, "baseline_count", None),
+        getattr(arguments, "baseline_rate", None),
+        getattr(arguments, "burst_count", None),
+        getattr(arguments, "burst_rate", None),
+    )
+    if any(value is not None for value in scheduled_values):
+        if any(value is None for value in scheduled_values):
+            raise ValueError("baseline and burst count/rate values must be supplied together")
+        baseline_count, baseline_rate, burst_count, burst_rate = scheduled_values
+        if not isinstance(baseline_count, int) or not 1 <= baseline_count <= 300:
+            raise ValueError("baseline count must be between one and 300")
+        if not isinstance(burst_count, int) or not 1 <= burst_count <= 1_000:
+            raise ValueError("burst count must be between one and 1000")
+        if not isinstance(baseline_rate, (int, float)) or not isinstance(burst_rate, (int, float)):
+            raise ValueError("baseline and burst rates must be numbers")
+        if not 0 < baseline_rate <= 100:
+            raise ValueError("baseline rate must be greater than zero and at most 100")
+        if not 0 < burst_rate <= 500:
+            raise ValueError("burst rate must be greater than zero and at most 500")
+        if burst_rate < baseline_rate * 2:
+            raise ValueError("burst rate must be at least twice baseline rate")
+        if getattr(arguments, "malformed_count", 0):
+            raise ValueError("malformed payload injection cannot be combined with a rate schedule")
+        return [
+            ProductionPhase("baseline", baseline_count, float(baseline_rate)),
+            ProductionPhase("burst", burst_count, float(burst_rate)),
+        ]
+
+    malformed_count = getattr(arguments, "malformed_count", 0)
+    if malformed_count > 500:
+        raise ValueError("malformed count must not exceed 500")
+    if malformed_count and arguments.count + malformed_count > 750:
+        raise ValueError("combined valid and malformed count must not exceed 750")
+    return [ProductionPhase("steady", arguments.count + malformed_count, arguments.rate)]
+
+
+def is_malformed_delivery(index: int, total: int, malformed_count: int) -> bool:
+    """Spread a fixed invalid count deterministically across one mixed batch."""
+
+    if not 0 <= malformed_count <= total:
+        raise ValueError("malformed count must be between zero and total deliveries")
+    return ((index + 1) * malformed_count // total) > (index * malformed_count // total)
+
+
+def malformed_order_payload(index: int, run_id: str) -> bytes:
+    """Return a safe deterministic payload missing required OrderEvent fields."""
+
+    return json.dumps(
+        {
+            "schema_version": "1.0",
+            "event_id": f"malformed-{index:06d}",
+            "run_id": run_id,
+            "invalid_reason": "missing_required_order_fields",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def run(arguments: argparse.Namespace, settings: Settings) -> int:
@@ -145,7 +245,8 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
     summary = DeliverySummary()
     started_at = time.monotonic()
     metrics = create_producer_metrics()
-    metrics.target_rate.set(arguments.rate)
+    phases = production_phases(arguments)
+    metrics.target_rate.set(phases[0].rate)
     metrics_server: MetricsServer | None = None
 
     if arguments.metrics_enabled:
@@ -211,6 +312,7 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
         error: KafkaError | None,
         message: Message,
         delivery_started_at: float,
+        malformed: bool,
     ) -> None:
         if error is not None:
             summary.failed += 1
@@ -225,69 +327,111 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             )
             return
         summary.sent += 1
+        summary.malformed_sent += int(malformed)
         metrics.orders_produced.inc()
         metrics.production_duration.observe(time.monotonic() - delivery_started_at)
+        if malformed:
+            logger.warning(
+                "Deterministic malformed scenario payload delivered",
+                extra={
+                    "event_type": "malformed_event_published",
+                    "topic": message.topic(),
+                },
+            )
 
-    interval_seconds = 1 / arguments.rate
-    next_delivery_at = time.monotonic()
+    total_deliveries = sum(phase.count for phase in phases)
+    malformed_count = getattr(arguments, "malformed_count", 0)
+    delivery_index = 0
+    valid_index = 0
 
     try:
-        for index in range(arguments.count):
+        for phase in phases:
+            metrics.target_rate.set(phase.rate)
+            logger.info(
+                "Order production phase started",
+                extra={
+                    "event_type": "production_phase_started",
+                    "phase": phase.name,
+                    "count": phase.count,
+                    "rate": phase.rate,
+                },
+            )
+            interval_seconds = 1 / phase.rate
+            next_delivery_at = time.monotonic()
+            for _phase_index in range(phase.count):
+                if shutdown_requested.is_set():
+                    break
+
+                wait_seconds = next_delivery_at - time.monotonic()
+                if wait_seconds > 0 and shutdown_requested.wait(wait_seconds):
+                    break
+
+                malformed = is_malformed_delivery(
+                    delivery_index,
+                    total_deliveries,
+                    malformed_count,
+                )
+                if malformed:
+                    key = f"malformed-{delivery_index:06d}".encode()
+                    payload = malformed_order_payload(delivery_index, arguments.run_id)
+                else:
+                    try:
+                        event = generate_order_event(
+                            index=valid_index,
+                            seed=arguments.seed,
+                            run_id=arguments.run_id,
+                            schema_version=arguments.schema_version,
+                        )
+                    except (ValidationError, ValueError) as error:
+                        summary.failed += 1
+                        metrics.production_errors.inc()
+                        logger.error(
+                            "Generated order event failed validation",
+                            extra={
+                                "event_type": "validation_failed",
+                                "error_type": type(error).__name__,
+                            },
+                        )
+                        delivery_index += 1
+                        continue
+                    key = str(event.event_id).encode("utf-8")
+                    payload = event.to_json_bytes()
+                    valid_index += 1
+
+                while not shutdown_requested.is_set():
+                    try:
+                        delivery_started_at = time.monotonic()
+                        producer.produce(
+                            topic=arguments.topic,
+                            key=key,
+                            value=payload,
+                            on_delivery=partial(
+                                delivery_report,
+                                delivery_started_at=delivery_started_at,
+                                malformed=malformed,
+                            ),
+                        )
+                        break
+                    except BufferError:
+                        producer.poll(0.5)
+                    except KafkaException as error:
+                        summary.failed += 1
+                        metrics.production_errors.inc()
+                        logger.error(
+                            "Order event production failed",
+                            extra={
+                                "event_type": "producer_error",
+                                "error_type": type(error).__name__,
+                                "topic": arguments.topic,
+                            },
+                        )
+                        break
+
+                producer.poll(0)
+                delivery_index += 1
+                next_delivery_at += interval_seconds
             if shutdown_requested.is_set():
                 break
-
-            wait_seconds = next_delivery_at - time.monotonic()
-            if wait_seconds > 0 and shutdown_requested.wait(wait_seconds):
-                break
-
-            try:
-                event = generate_order_event(
-                    index=index,
-                    seed=arguments.seed,
-                    run_id=arguments.run_id,
-                    schema_version=arguments.schema_version,
-                )
-            except (ValidationError, ValueError) as error:
-                summary.failed += 1
-                metrics.production_errors.inc()
-                logger.error(
-                    "Generated order event failed validation",
-                    extra={
-                        "event_type": "validation_failed",
-                        "error_type": type(error).__name__,
-                    },
-                )
-                continue
-
-            while not shutdown_requested.is_set():
-                try:
-                    delivery_started_at = time.monotonic()
-                    producer.produce(
-                        topic=arguments.topic,
-                        key=str(event.event_id).encode("utf-8"),
-                        value=event.to_json_bytes(),
-                        on_delivery=lambda error, message, started=delivery_started_at: (
-                            delivery_report(error, message, started)
-                        ),
-                    )
-                    break
-                except BufferError:
-                    producer.poll(0.5)
-                except KafkaException as error:
-                    summary.failed += 1
-                    metrics.production_errors.inc()
-                    logger.error(
-                        "Order event production failed",
-                        extra={
-                            "event_type": "producer_error",
-                            "error_type": type(error).__name__,
-                            "topic": arguments.topic,
-                        },
-                    )
-                    break
-
-            producer.poll(0)
-            next_delivery_at += interval_seconds
     except KafkaException as error:
         summary.failed += 1
         metrics.production_errors.inc()
@@ -313,9 +457,13 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
             "topic": arguments.topic,
             "count": summary.sent,
             "failed": summary.failed,
+            "malformed_count": summary.malformed_sent,
             "duration_ms": duration_ms,
         },
     )
+    grace_seconds = getattr(arguments, "metrics_grace_seconds", 0.0)
+    if grace_seconds and not shutdown_requested.is_set():
+        shutdown_requested.wait(grace_seconds)
     if metrics_server is not None:
         metrics_server.close()
     return 0 if summary.failed == 0 else 1

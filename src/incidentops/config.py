@@ -58,9 +58,15 @@ class Settings(BaseSettings):
     consumer_metrics_port: int = Field(default=8002, ge=1, le=65535)
     consumer_lag_update_interval_seconds: float = Field(default=2.0, ge=0.5, le=60.0)
     consumer_processing_delay_ms: int = Field(default=0, ge=0, le=5_000)
+    consumer_database_delay_ms: int = Field(default=0, ge=0, le=5_000)
     slow_processing_threshold_ms: int = Field(default=500, ge=0, le=60_000)
+    slow_database_threshold_ms: int = Field(default=500, ge=0, le=60_000)
 
-    llm_provider: Literal["openai-compatible", "scripted-test"] = "openai-compatible"
+    llm_provider: Literal[
+        "openai-compatible",
+        "scripted-test",
+        "deterministic-test",
+    ] = "openai-compatible"
     llm_model: str | None = None
     llm_base_url: str | None = None
     llm_api_key: SecretStr | None = None

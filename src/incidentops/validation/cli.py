@@ -14,7 +14,7 @@ from incidentops.validation.checks import (
     ValidationCheckError,
     artifact_directory,
     collect_slow_consumer_metrics,
-    delete_run_logs,
+    delete_run_logs_and_verify,
     error_log_counts,
     load_model,
     log_services_ready,
@@ -59,7 +59,7 @@ def _artifact_directory(_arguments: argparse.Namespace) -> int:
 
 
 def _delete_run_logs(arguments: argparse.Namespace) -> int:
-    delete_run_logs(arguments.run_id)
+    delete_run_logs_and_verify(arguments.run_id)
     return 0
 
 

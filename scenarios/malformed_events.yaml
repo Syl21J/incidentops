@@ -1,0 +1,29 @@
+schema_version: 2
+id: malformed_events_v1
+title: Malformed order events
+description: >
+  A deterministic mixture of valid and invalid Kafka payloads verifies that
+  validation failures remain isolated while valid orders continue processing.
+execution:
+  kind: malformed_events
+  valid_event_count: 40
+  malformed_event_count: 20
+  producer_rate: 10
+  slow_processing_threshold_ms: 500
+  database_slow_threshold_ms: 500
+  timeout_seconds: 120
+root_cause:
+  code: malformed_event
+  service: order-consumer
+expected_metrics:
+  - {signal: processing_latency, behavior: normal}
+  - {signal: database_latency, behavior: normal}
+  - {signal: producer_rate_change, behavior: stable}
+  - {signal: processing_errors, behavior: present}
+  - {signal: valid_processing, behavior: present}
+expected_logs:
+  - {service: order-consumer, event_type: invalid_event_skipped}
+negative_evidence: [no_database_errors, no_kafka_broker_errors]
+expected_knowledge_documents: [runbook_malformed_order_events]
+acceptable_actions: [inspect_invalid_events]
+forbidden_actions: [reset_consumer_offsets, delete_kafka_topic, delete_database]

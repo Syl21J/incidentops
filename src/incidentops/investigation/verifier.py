@@ -19,6 +19,12 @@ from incidentops.investigation.models import (
     evidence_id_for_task,
 )
 from incidentops.investigation.state import InvestigationState
+from incidentops.metric_query import (
+    ELEVATED_DATABASE_SECONDS,
+    ELEVATED_PROCESSING_SECONDS,
+    PRODUCER_SURGE_RATE_DELTA,
+    PRODUCER_SURGE_RATIO,
+)
 
 
 def _all_evidence(
@@ -102,6 +108,28 @@ def _validate_processing_latency_summary(item: MetricEvidence) -> list[str]:
     sample_count = raw.get("sample_count")
     if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
         issues.append(f"processing latency evidence {item.evidence_id} has no samples")
+    database_duration = _finite_number(raw.get("database_duration_seconds"))
+    database_sample_count = raw.get("database_sample_count")
+    if database_duration is None or database_duration < 0:
+        issues.append(f"database latency evidence {item.evidence_id} has invalid values")
+    if (
+        isinstance(database_sample_count, bool)
+        or not isinstance(database_sample_count, int)
+        or database_sample_count <= 0
+    ):
+        issues.append(f"database latency evidence {item.evidence_id} has no samples")
+    expected_processing_state = (
+        "elevated" if duration is not None and duration >= ELEVATED_PROCESSING_SECONDS else "normal"
+    )
+    expected_database_state = (
+        "elevated"
+        if database_duration is not None and database_duration >= ELEVATED_DATABASE_SECONDS
+        else "normal"
+    )
+    if raw.get("processing_state") != expected_processing_state:
+        issues.append(f"processing latency evidence {item.evidence_id} has an invalid state")
+    if raw.get("database_state") != expected_database_state:
+        issues.append(f"database latency evidence {item.evidence_id} has an invalid state")
     return issues
 
 
@@ -123,6 +151,30 @@ def _validate_rate_summary(item: MetricEvidence) -> list[str]:
         and (abs(difference - (producer - consumer)) > 1e-9 or slower is not (difference > 0))
     ):
         issues.append(f"rate evidence {item.evidence_id} is internally inconsistent")
+    baseline = _finite_number(raw.get("producer_baseline_rate_per_second"))
+    recent = _finite_number(raw.get("producer_recent_rate_per_second"))
+    ratio = _finite_number(raw.get("producer_rate_change_ratio"))
+    error_rate = _finite_number(raw.get("processing_error_rate_per_second"))
+    if any(value is None or value < 0 for value in (baseline, recent, ratio, error_rate)):
+        issues.append(f"rate evidence {item.evidence_id} has an incomplete health profile")
+    else:
+        baseline_value = cast(float, baseline)
+        recent_value = cast(float, recent)
+        ratio_value = cast(float, ratio)
+        error_rate_value = cast(float, error_rate)
+        expected_ratio = recent_value / baseline_value if baseline_value > 0.001 else 1.0
+        if abs(ratio_value - expected_ratio) > 1e-6:
+            issues.append(f"rate evidence {item.evidence_id} has an invalid change ratio")
+        expected_surge = (
+            ratio_value >= PRODUCER_SURGE_RATIO
+            and recent_value - baseline_value >= PRODUCER_SURGE_RATE_DELTA
+        )
+        if raw.get("producer_surge") is not expected_surge:
+            issues.append(f"rate evidence {item.evidence_id} has an invalid surge state")
+        if raw.get("processing_errors_present") is not (error_rate_value > 0.001):
+            issues.append(f"rate evidence {item.evidence_id} has an invalid error state")
+    if not isinstance(raw.get("valid_processing_present"), bool):
+        issues.append(f"rate evidence {item.evidence_id} has an invalid consumer health state")
     return issues
 
 
@@ -212,11 +264,17 @@ def _slow_consumer_issues(
     slow_logs = cast(LogEvidence, evidence_by_id["log-slow-processing-summary"])
     if lag.raw_value_summary.get("trend") != "increasing":
         issues.append("consumer lag did not increase")
-    if (_finite_number(latency.raw_value_summary.get("duration_seconds")) or 0.0) <= 0:
-        issues.append("processing latency has no positive observation")
+    if latency.raw_value_summary.get("processing_state") != "elevated":
+        issues.append("processing latency was not elevated")
+    if latency.raw_value_summary.get("database_state") != "normal":
+        issues.append("database latency was not normal")
     if rates.raw_value_summary.get("consumer_is_slower") is not True:
         issues.append("consumer throughput was not lower than producer throughput")
-    if slow_logs.matching_log_count <= 0:
+    if rates.raw_value_summary.get("producer_surge") is not False:
+        issues.append("producer throughput surged during the slow consumer window")
+    if rates.raw_value_summary.get("processing_errors_present") is not False:
+        issues.append("processing errors conflict with the slow consumer diagnosis")
+    if (_finite_number(slow_logs.raw_value_summary.get("slow_processing_count")) or 0) <= 0:
         issues.append("no slow-processing log evidence was found")
 
     positive_error_types = {
@@ -239,18 +297,34 @@ def _database_latency_issues(
     supporting_ids: set[str],
     evidence_by_id: EvidenceById,
 ) -> list[str]:
-    evidence_id = evidence_id_for_task(InvestigationTaskType.FIND_DATABASE_ERRORS)
-    item = evidence_by_id.get(evidence_id)
-    if (
-        evidence_id not in supporting_ids
-        or not isinstance(item, LogEvidence)
-        or item.matching_log_count <= 0
-    ):
-        return ["database latency lacks positive database evidence"]
-    latency_id = evidence_id_for_task(InvestigationTaskType.CHECK_PROCESSING_LATENCY)
-    if latency_id not in supporting_ids:
-        return ["database latency lacks processing latency evidence"]
-    return []
+    required_support = {
+        evidence_id_for_task(InvestigationTaskType.CHECK_CONSUMER_LAG),
+        evidence_id_for_task(InvestigationTaskType.CHECK_PROCESSING_LATENCY),
+        evidence_id_for_task(InvestigationTaskType.COMPARE_PRODUCER_CONSUMER_RATES),
+        evidence_id_for_task(InvestigationTaskType.FIND_SLOW_PROCESSING_LOGS),
+        evidence_id_for_task(InvestigationTaskType.FIND_DATABASE_ERRORS, negative=True),
+        evidence_id_for_task(InvestigationTaskType.FIND_KAFKA_ERRORS, negative=True),
+    }
+    issues: list[str] = []
+    if not required_support <= supporting_ids:
+        issues.append("database latency diagnosis does not cite every required evidence check")
+    lag = cast(MetricEvidence, evidence_by_id["metric-consumer-lag-summary"])
+    latency = cast(MetricEvidence, evidence_by_id["metric-processing-latency-p95"])
+    rates = cast(MetricEvidence, evidence_by_id["metric-producer-consumer-rate-comparison"])
+    logs = cast(LogEvidence, evidence_by_id["log-slow-processing-summary"])
+    if lag.raw_value_summary.get("trend") != "increasing":
+        issues.append("consumer lag did not increase")
+    if latency.raw_value_summary.get("processing_state") != "elevated":
+        issues.append("processing latency was not elevated")
+    if latency.raw_value_summary.get("database_state") != "elevated":
+        issues.append("database latency was not elevated")
+    if (_finite_number(logs.raw_value_summary.get("database_operation_slow_count")) or 0) <= 0:
+        issues.append("no slow database operation log evidence was found")
+    if rates.raw_value_summary.get("producer_surge") is not False:
+        issues.append("producer throughput surge conflicts with database latency")
+    if rates.raw_value_summary.get("processing_errors_present") is not False:
+        issues.append("processing errors conflict with database latency")
+    return issues
 
 
 def _kafka_broker_failure_issues(
@@ -268,8 +342,66 @@ def _kafka_broker_failure_issues(
     return []
 
 
-def _traffic_spike_issues(_supporting_ids: set[str], _evidence_by_id: EvidenceById) -> list[str]:
-    return ["traffic spike cannot be distinguished without producer target-rate evidence"]
+def _traffic_spike_issues(
+    supporting_ids: set[str],
+    evidence_by_id: EvidenceById,
+) -> list[str]:
+    required_support = {
+        evidence_id_for_task(InvestigationTaskType.CHECK_CONSUMER_LAG),
+        evidence_id_for_task(InvestigationTaskType.CHECK_PROCESSING_LATENCY),
+        evidence_id_for_task(InvestigationTaskType.COMPARE_PRODUCER_CONSUMER_RATES),
+        evidence_id_for_task(InvestigationTaskType.FIND_DATABASE_ERRORS, negative=True),
+        evidence_id_for_task(InvestigationTaskType.FIND_KAFKA_ERRORS, negative=True),
+    }
+    issues: list[str] = []
+    if not required_support <= supporting_ids:
+        issues.append("traffic spike diagnosis does not cite every required evidence check")
+    lag = cast(MetricEvidence, evidence_by_id["metric-consumer-lag-summary"])
+    latency = cast(MetricEvidence, evidence_by_id["metric-processing-latency-p95"])
+    rates = cast(MetricEvidence, evidence_by_id["metric-producer-consumer-rate-comparison"])
+    if lag.raw_value_summary.get("trend") != "increasing":
+        issues.append("consumer lag did not increase during the producer surge")
+    if latency.raw_value_summary.get("processing_state") != "normal":
+        issues.append("processing latency was not normal during the producer surge")
+    if latency.raw_value_summary.get("database_state") != "normal":
+        issues.append("database latency was not normal during the producer surge")
+    if rates.raw_value_summary.get("producer_surge") is not True:
+        issues.append("observed producer throughput did not surge")
+    if rates.raw_value_summary.get("processing_errors_present") is not False:
+        issues.append("processing errors conflict with a pure traffic spike")
+    return issues
+
+
+def _malformed_event_issues(
+    supporting_ids: set[str],
+    evidence_by_id: EvidenceById,
+) -> list[str]:
+    required_support = {
+        evidence_id_for_task(InvestigationTaskType.CHECK_PROCESSING_LATENCY),
+        evidence_id_for_task(InvestigationTaskType.COMPARE_PRODUCER_CONSUMER_RATES),
+        evidence_id_for_task(InvestigationTaskType.FIND_SLOW_PROCESSING_LOGS),
+        evidence_id_for_task(InvestigationTaskType.FIND_DATABASE_ERRORS, negative=True),
+        evidence_id_for_task(InvestigationTaskType.FIND_KAFKA_ERRORS, negative=True),
+    }
+    issues: list[str] = []
+    if not required_support <= supporting_ids:
+        issues.append("malformed event diagnosis does not cite every required evidence check")
+    latency = cast(MetricEvidence, evidence_by_id["metric-processing-latency-p95"])
+    rates = cast(MetricEvidence, evidence_by_id["metric-producer-consumer-rate-comparison"])
+    logs = cast(LogEvidence, evidence_by_id["log-slow-processing-summary"])
+    if latency.raw_value_summary.get("processing_state") != "normal":
+        issues.append("processing latency was not normal for malformed events")
+    if latency.raw_value_summary.get("database_state") != "normal":
+        issues.append("database latency was not normal for malformed events")
+    if rates.raw_value_summary.get("processing_errors_present") is not True:
+        issues.append("processing error telemetry did not increase")
+    if rates.raw_value_summary.get("producer_surge") is not False:
+        issues.append("producer throughput surge conflicts with malformed events")
+    if rates.raw_value_summary.get("valid_processing_present") is not True:
+        issues.append("no successful processing proved that the consumer remained healthy")
+    if (_finite_number(logs.raw_value_summary.get("invalid_event_count")) or 0) <= 0:
+        issues.append("no invalid-event log evidence was found")
+    return issues
 
 
 def _insufficient_evidence_issues(
@@ -283,6 +415,7 @@ _ALTERNATIVE_CAUSE_VALIDATORS: dict[RootCauseCode, CauseValidator] = {
     RootCauseCode.DATABASE_LATENCY: _database_latency_issues,
     RootCauseCode.KAFKA_BROKER_FAILURE: _kafka_broker_failure_issues,
     RootCauseCode.TRAFFIC_SPIKE: _traffic_spike_issues,
+    RootCauseCode.MALFORMED_EVENT: _malformed_event_issues,
     RootCauseCode.INSUFFICIENT_EVIDENCE: _insufficient_evidence_issues,
 }
 

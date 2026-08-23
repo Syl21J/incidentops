@@ -48,9 +48,11 @@ state across ordinary container restarts.
 ## How the services work
 
 - **Producer:** validates generated order events, publishes them to Kafka, emits JSON logs,
-  and exposes production metrics on port `8001`.
+  and exposes production metrics on port `8001`. Explicit test modes can execute one bounded
+  baseline/burst schedule or interleave a fixed number of malformed payloads.
 - **Consumer:** reads Kafka events, writes them idempotently to PostgreSQL, reports consumer
-  lag and processing metrics on port `8002`, and emits correlated JSON logs.
+  lag, processing, database, and validation metrics on port `8002`, and emits correlated JSON
+  logs. Scenario-only processing and database delays are disabled by default.
 - **Filebeat and Elasticsearch:** Filebeat tails `logs/*.jsonl`, keeps its read position in a
   persistent registry, and indexes structured events in `incidentops-logs-*`.
 - **Prometheus:** scrapes both application endpoints and retains local samples for six hours,
@@ -175,13 +177,36 @@ and prints the main summaries:
 | Producer metrics | `http://localhost:8001/metrics` |
 | Consumer metrics | `http://localhost:8002/metrics` |
 
-## Run an investigation
+## Executable incident scenarios
 
-The implemented scenario is `slow_consumer_v1`. It creates a bounded consumer slowdown and
-expects correlated lag, processing latency, throughput, and log evidence without database or
-Kafka errors.
+Four versioned manifests under `scenarios/` combine bounded execution parameters with ground
+truth used only after an investigation. Several share increasing Kafka lag, so a diagnosis must
+also use the latency, rate, error, and log profile.
 
-Run the scenario alone:
+| Scenario | Explicit fault mechanism | Expected distinguishing signature | Root cause |
+| --- | --- | --- | --- |
+| `slow_consumer_v1` | 800 ms delay in the complete consumer path | lag and processing latency increase; database latency stays normal; `slow_processing` appears | `slow_consumer_processing` |
+| `database_latency_v1` | bounded `pg_sleep()` inside the measured order transaction | lag, processing latency, and database latency increase; `database_operation_slow` appears | `database_latency` |
+| `traffic_spike_v1` | observed baseline followed by a bounded producer burst | producer counter rate surges and lag increases while processing and database latency stay normal | `traffic_spike` |
+| `malformed_events_v1` | deterministic mixture of valid and invalid Kafka payloads | processing errors and `invalid_event_skipped` increase while valid events continue and database latency stays normal | `malformed_event` |
+
+Every fault is activated only by explicit scenario CLI arguments. Normal producer and consumer
+defaults do not inject malformed messages, rate schedules, processing delays, or database
+delays. Run one scenario through the common harness with:
+
+```bash
+uv run python -m incidentops.scenario_runner.cli run \
+  --scenario database_latency_v1 \
+  --output-metadata /tmp/database-latency-metadata.json
+```
+
+The harness creates a unique `run_id`, topic, consumer group, SQL row prefix, log directory,
+and exact time window. It stops owned processes and deletes only those resources. Add
+`--retain-evidence` only when a follow-up investigation needs that run's Elasticsearch
+documents; topic, group, SQL, and JSONL cleanup still occurs. Exported metadata contains
+operational observations but no root cause or expected evidence.
+
+The original slow-consumer entry point remains available:
 
 ```bash
 ./scripts/check-slow-consumer-scenario.sh
@@ -196,6 +221,29 @@ Prometheus and Elasticsearch data:
 
 Artifacts requested with `--persist-artifacts` are written under the ignored
 `artifacts/investigations/` directory.
+
+### Multi-incident benchmark
+
+The primary Stage Seven validation injects all four scenarios sequentially. Each incident is
+injected once, then the same retained telemetry window is investigated with knowledge disabled
+and with knowledge required:
+
+```bash
+./scripts/check-multi-incident-benchmark.sh
+```
+
+The benchmark gives LangGraph only a neutral description, `order-consumer`, the exact window,
+and the run identifier. The deterministic test provider sees the same structured evidence and
+retrieved references as a live model; it receives neither the scenario identifier nor the
+manifest. Deterministic verification still decides whether the proposed cause is supported.
+
+Results under the ignored `artifacts/benchmarks/` directory include per-scenario diagnoses, a
+true-by-predicted confusion matrix, root-cause accuracy and rank, macro positive and negative
+evidence recall, knowledge recall@k, unsupported reference and forbidden-action counts,
+insufficient-evidence rate, call counts, and duration. RAG deltas are always reported as
+required-RAG minus no-RAG. Four scenarios are a functional comparison, not evidence of
+statistical significance; equal diagnosis accuracy is reported as equal, with citations and
+operational context assessed separately.
 
 ### Optional knowledge retrieval
 
@@ -217,6 +265,16 @@ be downloaded on first use. Run the deterministic baseline-versus-RAG validation
 ```bash
 ./scripts/check-rag-workflow.sh
 ```
+
+Live evidence builds different bounded retrieval queries. The evaluator, and never the graph,
+holds these expected document targets:
+
+| Scenario | Expected relevant documents |
+| --- | --- |
+| Slow consumer | `incident_slow_consumer_processing`, `metric_processing_duration` |
+| Database latency | `incident_database_latency_backlog` |
+| Traffic spike | `incident_traffic_spike_backlog`, `metric_producer_consumer_rates` |
+| Malformed events | `runbook_malformed_order_events` |
 
 ### Live LLM validation
 
@@ -240,6 +298,16 @@ This is the only validation script that contacts an external model. It uses the 
 requires hybrid retrieval, may make up to four billable model calls, evaluates the resulting
 report, and keeps the generated report, trace, and evaluation under
 `artifacts/investigations/`.
+
+An optional live multi-incident run uses the same bounded benchmark and is never executed by
+automated validation:
+
+```bash
+uv run python -m incidentops.benchmark.cli run \
+  --all \
+  --model-provider openai \
+  --knowledge-mode required
+```
 
 For a manually selected incident window, use the investigation CLI directly:
 
@@ -287,6 +355,7 @@ With the initialized services running, use the following progression:
 | Slow-consumer evidence | `./scripts/check-slow-consumer-scenario.sh` | No |
 | Bounded investigation | `./scripts/check-agent-workflow.sh` | No |
 | Baseline and RAG comparison | `./scripts/check-rag-workflow.sh` | No |
+| Four-scenario RAG/no-RAG benchmark | `./scripts/check-multi-incident-benchmark.sh` | No |
 | Live-model RAG workflow | `./scripts/check-live-rag-workflow.sh` | Yes |
 
 The scripts use unique topics, groups, run identifiers, and row prefixes. Their cleanup is
@@ -300,7 +369,7 @@ important groups are:
 
 - PostgreSQL, Kafka, Elasticsearch, and Prometheus endpoints
 - application logging and metrics ports
-- the disabled-by-default consumer delay used by the test scenario
+- the disabled-by-default processing and database delays used only by explicit scenarios
 - embedding and optional knowledge-retrieval settings
 - live model credentials and timeouts
 - hard investigation limits
@@ -313,6 +382,8 @@ uv run incidentops-consumer --help
 uv run incidentops-log-search --help
 uv run incidentops-metric-query --help
 uv run incidentops-knowledge --help
+uv run incidentops-scenario --help
+uv run incidentops-benchmark --help
 ```
 
 ## Troubleshooting

@@ -61,8 +61,8 @@ def _parser() -> argparse.ArgumentParser:
     investigate.add_argument("--output-file", type=Path)
     investigate.add_argument(
         "--model-provider",
-        choices=("openai-compatible", "scripted-test"),
-        help=("Override LLM_PROVIDER. scripted-test is deterministic and non-production."),
+        choices=("openai-compatible", "scripted-test", "deterministic-test"),
+        help=("Override LLM_PROVIDER with an explicit live or non-production provider."),
     )
     investigate.add_argument(
         "--persist-artifacts",

@@ -39,6 +39,11 @@ ELASTICSEARCH_TIMEOUT_SECONDS = 10.0
 
 DATABASE_ERROR_EVENTS = ("database_connection_failed", "database_write_failed")
 KAFKA_ERROR_EVENTS = ("consumer_error", "producer_error", "delivery_failed", "topic_error")
+APPLICATION_SIGNAL_EVENTS = (
+    "slow_processing",
+    "database_operation_slow",
+    "invalid_event_skipped",
+)
 
 ALLOWED_INVESTIGATION_TOOLS = frozenset(InvestigationTaskType)
 
@@ -209,13 +214,17 @@ class InvestigationToolset:
         return MetricEvidence(
             evidence_id=evidence_id_for_task(InvestigationTaskType.CHECK_PROCESSING_LATENCY),
             metric_type=MetricEvidenceType.PROCESSING_LATENCY,
-            observation="The bounded P95 processing-latency summary was collected.",
+            observation="The bounded processing and database latency profile was collected.",
             start_time=tool_input.start_time,
             end_time=tool_input.end_time,
             raw_value_summary={
                 "percentile": summary.percentile,
                 "duration_seconds": summary.duration_seconds,
                 "sample_count": summary.sample_count,
+                "processing_state": summary.processing_state,
+                "database_duration_seconds": summary.database_duration_seconds,
+                "database_sample_count": summary.database_sample_count,
+                "database_state": summary.database_state,
             },
             availability=EvidenceAvailability.AVAILABLE,
             collection_attempt=tool_input.investigation_attempt,
@@ -253,6 +262,13 @@ class InvestigationToolset:
                 "consumer_windowed_rate_per_second": summary.consumer_rate,
                 "windowed_rate_difference_per_second": summary.rate_difference,
                 "consumer_is_slower": summary.consumer_is_slower,
+                "producer_baseline_rate_per_second": summary.producer_baseline_rate,
+                "producer_recent_rate_per_second": summary.producer_recent_rate,
+                "producer_rate_change_ratio": summary.producer_rate_change_ratio,
+                "producer_surge": summary.producer_surge,
+                "processing_error_rate_per_second": summary.processing_error_rate,
+                "processing_errors_present": summary.processing_errors_present,
+                "valid_processing_present": summary.valid_processing_present,
             },
             availability=EvidenceAvailability.AVAILABLE,
             collection_attempt=tool_input.investigation_attempt,
@@ -286,7 +302,7 @@ class InvestigationToolset:
                     start=tool_input.start_time,
                     end=tool_input.end_time,
                     services=["order-consumer"],
-                    event_types=["slow_processing"],
+                    event_types=list(APPLICATION_SIGNAL_EVENTS),
                     run_id=tool_input.run_id,
                     limit=MAX_LOG_TIMELINE_ENTRIES,
                 ),
@@ -299,15 +315,22 @@ class InvestigationToolset:
                 error,
             )
         timeline = [item.timestamp for item in result.logs]
+        event_counts = {
+            event_type: sum(item.event_type == event_type for item in result.logs)
+            for event_type in APPLICATION_SIGNAL_EVENTS
+        }
         return LogEvidence(
             evidence_id=evidence_id_for_task(task_type),
             log_type=LogEvidenceType.SLOW_PROCESSING,
-            observation=f"Elasticsearch found {result.total} slow-processing events.",
+            observation=f"Elasticsearch found {result.total} bounded application signal events.",
             start_time=tool_input.start_time,
             end_time=tool_input.end_time,
             raw_value_summary={
                 "matching_log_count": result.total,
                 "timeline_entries_returned": len(timeline),
+                "slow_processing_count": event_counts["slow_processing"],
+                "database_operation_slow_count": event_counts["database_operation_slow"],
+                "invalid_event_count": event_counts["invalid_event_skipped"],
             },
             availability=EvidenceAvailability.AVAILABLE,
             collection_attempt=tool_input.investigation_attempt,
@@ -372,13 +395,13 @@ TOOL_DESCRIPTIONS: dict[InvestigationTaskType, str] = {
         "Return a bounded deterministic consumer-lag summary for the exact incident window."
     ),
     InvestigationTaskType.CHECK_PROCESSING_LATENCY: (
-        "Return a bounded deterministic P95 processing-latency summary."
+        "Return bounded deterministic processing and database P95 latency summaries."
     ),
     InvestigationTaskType.COMPARE_PRODUCER_CONSUMER_RATES: (
-        "Compare bounded active producer and consumer throughput summaries."
+        "Compare bounded throughput, producer change, processing errors, and consumer health."
     ),
     InvestigationTaskType.FIND_SLOW_PROCESSING_LOGS: (
-        "Count structured slow-processing events without exposing raw queries."
+        "Count slow-processing, slow-database, and invalid-event signals without raw queries."
     ),
     InvestigationTaskType.FIND_DATABASE_ERRORS: (
         "Check structured database error events and explicitly report zero matches."

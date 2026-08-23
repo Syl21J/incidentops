@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -47,7 +48,10 @@ KAFKA_ERROR_EVENTS = frozenset(
 )
 APPLICATION_SERVICES = frozenset({"order-producer", "order-consumer"})
 PROMETHEUS_JOBS = frozenset({"incidentops-producer", "incidentops-consumer"})
-CLEANUP_RUN_ID_PATTERN = re.compile(r"^(?:slow-consumer|log-pipeline-check)-\d+-\d+$")
+CLEANUP_RUN_ID_PATTERN = re.compile(
+    r"^(?:incident-run|slow-consumer|database-latency|traffic-spike|malformed-events|"
+    r"log-pipeline-check)-\d+-\d+$"
+)
 
 
 class ValidationCheckError(RuntimeError):
@@ -131,6 +135,60 @@ def delete_run_logs(run_id: str, *, elasticsearch_url: str | None = None) -> Non
         )
     finally:
         client.close()
+
+
+def count_run_logs(run_id: str, *, elasticsearch_url: str | None = None) -> int:
+    """Count only documents for one exact isolated run after scoped cleanup."""
+
+    validated_run_id = TypeAdapter(Identifier).validate_python(run_id)
+    if CLEANUP_RUN_ID_PATTERN.fullmatch(validated_run_id) is None:
+        raise ValidationCheckError("run_id is not an isolated validation-run identifier")
+    client = Elasticsearch(
+        elasticsearch_url or Settings().elasticsearch_url,
+        request_timeout=10,
+    )
+    try:
+        response = client.count(
+            index=INDEX_PATTERN,
+            query={"term": {"run_id": validated_run_id}},
+            allow_no_indices=True,
+            ignore_unavailable=True,
+        )
+        return int(response["count"])
+    finally:
+        client.close()
+
+
+def delete_run_logs_and_verify(
+    run_id: str,
+    *,
+    elasticsearch_url: str | None = None,
+    maximum_attempts: int = 20,
+    stable_zero_observations: int = 3,
+    poll_interval_seconds: float = 1.0,
+) -> None:
+    """Delete one run repeatedly until delayed Filebeat delivery has settled at zero."""
+
+    if not 1 <= maximum_attempts <= 60:
+        raise ValueError("cleanup attempts must be between one and 60")
+    if not 1 <= stable_zero_observations <= maximum_attempts:
+        raise ValueError("stable zero observations must fit within cleanup attempts")
+    if not 0 <= poll_interval_seconds <= 5:
+        raise ValueError("cleanup polling interval must be between zero and five seconds")
+
+    consecutive_zeroes = 0
+    remaining = 0
+    for attempt in range(maximum_attempts):
+        delete_run_logs(run_id, elasticsearch_url=elasticsearch_url)
+        remaining = count_run_logs(run_id, elasticsearch_url=elasticsearch_url)
+        consecutive_zeroes = consecutive_zeroes + 1 if remaining == 0 else 0
+        if consecutive_zeroes >= stable_zero_observations:
+            return
+        if attempt + 1 < maximum_attempts:
+            time.sleep(poll_interval_seconds)
+    raise ValidationCheckError(
+        f"run-scoped Elasticsearch cleanup did not settle; {remaining} documents remain"
+    )
 
 
 def validate_retrieval_benchmark(path: Path) -> RetrievalEvaluationResult:
@@ -390,9 +448,20 @@ def collect_slow_consumer_metrics(start: datetime) -> SlowConsumerMetrics:
         lag_samples=lag.sample_count,
         p95_seconds=latency.duration_seconds,
         latency_samples=latency.sample_count,
+        database_p95_seconds=latency.database_duration_seconds,
+        database_latency_samples=latency.database_sample_count,
+        processing_state=latency.processing_state,
+        database_state=latency.database_state,
         producer_rate=rates.producer_rate,
         consumer_rate=rates.consumer_rate,
         consumer_is_slower=rates.consumer_is_slower,
+        producer_baseline_rate=rates.producer_baseline_rate,
+        producer_recent_rate=rates.producer_recent_rate,
+        producer_rate_change_ratio=rates.producer_rate_change_ratio,
+        producer_surge=rates.producer_surge,
+        processing_error_rate=rates.processing_error_rate,
+        processing_errors_present=rates.processing_errors_present,
+        valid_processing_present=rates.valid_processing_present,
     )
 
 

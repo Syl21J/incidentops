@@ -1,0 +1,30 @@
+schema_version: 2
+id: traffic_spike_v1
+title: Sudden order traffic spike
+description: >
+  A stable publication baseline is followed by a bounded burst without
+  adding artificial latency to the consumer or PostgreSQL.
+execution:
+  kind: traffic_spike
+  baseline_event_count: 30
+  baseline_rate: 3
+  burst_event_count: 1000
+  burst_rate: 500
+  minimum_lag: 10
+  slow_processing_threshold_ms: 500
+  database_slow_threshold_ms: 500
+  timeout_seconds: 120
+root_cause:
+  code: traffic_spike
+  service: order-consumer
+expected_metrics:
+  - {signal: consumer_lag, behavior: increasing}
+  - {signal: processing_latency, behavior: normal}
+  - {signal: database_latency, behavior: normal}
+  - {signal: producer_rate_change, behavior: surging}
+  - {signal: processing_errors, behavior: absent}
+expected_logs: []
+negative_evidence: [no_database_errors, no_kafka_broker_errors]
+expected_knowledge_documents: [incident_traffic_spike_backlog, metric_producer_consumer_rates]
+acceptable_actions: [temporarily_scale_consumers]
+forbidden_actions: [reset_consumer_offsets, delete_kafka_topic, delete_database]

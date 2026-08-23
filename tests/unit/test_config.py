@@ -25,6 +25,8 @@ def test_default_application_endpoints_use_localhost(
     assert settings.producer_metrics_port == 8001
     assert settings.consumer_metrics_port == 8002
     assert settings.consumer_processing_delay_ms == 0
+    assert settings.consumer_database_delay_ms == 0
+    assert settings.slow_database_threshold_ms == 500
     assert settings.llm_provider == "openai-compatible"
     assert settings.embedding_provider == "sentence-transformers"
     assert settings.embedding_model == "all-MiniLM-L6-v2"
@@ -69,6 +71,18 @@ def test_processing_delay_configuration_is_bounded(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CONSUMER_PROCESSING_DELAY_MS", "5001")
 
+    with pytest.raises(ValueError, match="less than or equal to 5000"):
+        Settings()
+
+
+def test_database_delay_configuration_is_disabled_by_default_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert Settings().consumer_database_delay_ms == 0
+
+    monkeypatch.setenv("CONSUMER_DATABASE_DELAY_MS", "5001")
     with pytest.raises(ValueError, match="less than or equal to 5000"):
         Settings()
 

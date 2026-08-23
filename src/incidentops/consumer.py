@@ -67,6 +67,15 @@ def slow_threshold_ms(value: str) -> int:
     return parsed
 
 
+def database_delay_ms(value: str) -> int:
+    """Parse the bounded scenario-only PostgreSQL operation delay."""
+
+    parsed = int(value)
+    if not 0 <= parsed <= 5_000:
+        raise argparse.ArgumentTypeError("database delay must be between 0 and 5000 ms")
+    return parsed
+
+
 def calculate_partition_lag(
     low_offset: int,
     high_offset: int,
@@ -143,6 +152,27 @@ def log_slow_processing(
     )
 
 
+def log_slow_database_operation(
+    logger: logging.Logger,
+    event: OrderEvent,
+    duration_ms: float,
+    threshold_ms: int,
+) -> None:
+    """Emit bounded database-latency evidence without exposing SQL or parameters."""
+
+    if duration_ms < threshold_ms:
+        return
+    logger.warning(
+        "Database operation exceeded the configured slow threshold",
+        extra={
+            "event_type": "database_operation_slow",
+            "event_id": str(event.event_id),
+            "order_id": str(event.order_id),
+            "duration_ms": round(duration_ms, 2),
+        },
+    )
+
+
 def build_parser(settings: Settings) -> argparse.ArgumentParser:
     """Build the consumer command-line parser."""
 
@@ -163,9 +193,20 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Development/test-only artificial delay inside each message processing path.",
     )
     parser.add_argument(
+        "--database-delay-ms",
+        type=database_delay_ms,
+        default=settings.consumer_database_delay_ms,
+        help="Scenario-only delay inside the measured PostgreSQL transaction.",
+    )
+    parser.add_argument(
         "--slow-processing-threshold-ms",
         type=slow_threshold_ms,
         default=settings.slow_processing_threshold_ms,
+    )
+    parser.add_argument(
+        "--slow-database-threshold-ms",
+        type=slow_threshold_ms,
+        default=settings.slow_database_threshold_ms,
     )
     parser.add_argument(
         "--lag-update-interval-seconds",
@@ -395,7 +436,11 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
 
             database_started_at = time.monotonic()
             try:
-                inserted = insert_order(connection, event)
+                inserted = insert_order(
+                    connection,
+                    event,
+                    artificial_delay_ms=arguments.database_delay_ms,
+                )
             except psycopg.Error as error:
                 metrics.database_duration.observe(time.monotonic() - database_started_at)
                 metrics.processing_duration.observe(time.monotonic() - event_started_at)
@@ -411,7 +456,14 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
                 )
                 exit_code = 1
                 break
-            metrics.database_duration.observe(time.monotonic() - database_started_at)
+            database_duration_seconds = time.monotonic() - database_started_at
+            metrics.database_duration.observe(database_duration_seconds)
+            log_slow_database_operation(
+                logger,
+                event,
+                database_duration_seconds * 1000,
+                arguments.slow_database_threshold_ms,
+            )
 
             # The database transaction is committed before this offset commit.
             commit_message(consumer, message)

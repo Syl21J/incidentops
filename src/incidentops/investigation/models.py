@@ -87,6 +87,7 @@ class RootCauseCode(StrEnum):
     DATABASE_LATENCY = "database_latency"
     KAFKA_BROKER_FAILURE = "kafka_broker_failure"
     TRAFFIC_SPIKE = "traffic_spike"
+    MALFORMED_EVENT = "malformed_event"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 
 
@@ -98,6 +99,7 @@ class RecommendedActionCode(StrEnum):
     TEMPORARILY_SCALE_CONSUMERS = "temporarily_scale_consumers"
     INSPECT_DATABASE_LATENCY = "inspect_database_latency"
     INSPECT_KAFKA_HEALTH = "inspect_kafka_health"
+    INSPECT_INVALID_EVENTS = "inspect_invalid_events"
     COLLECT_MORE_EVIDENCE = "collect_more_evidence"
 
 

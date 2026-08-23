@@ -12,6 +12,7 @@ from incidentops.investigation.policy import InvestigationPolicy
 from incidentops.validation.checks import (
     ValidationCheckError,
     delete_run_logs,
+    delete_run_logs_and_verify,
     error_log_counts,
     log_services_ready,
     prometheus_targets_ready,
@@ -68,6 +69,51 @@ def test_investigation_policy_groups_and_validates_limits() -> None:
 def test_elasticsearch_cleanup_rejects_non_validation_run_ids() -> None:
     with pytest.raises(ValidationCheckError, match="isolated validation-run"):
         delete_run_logs("local")
+
+
+def test_elasticsearch_cleanup_waits_for_delayed_filebeat_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delete_calls: list[str] = []
+    counts = iter([2, 0, 0, 0])
+    monkeypatch.setattr(
+        "incidentops.validation.checks.delete_run_logs",
+        lambda run_id, **_kwargs: delete_calls.append(run_id),
+    )
+    monkeypatch.setattr(
+        "incidentops.validation.checks.count_run_logs",
+        lambda _run_id, **_kwargs: next(counts),
+    )
+    monkeypatch.setattr("incidentops.validation.checks.time.sleep", lambda _seconds: None)
+
+    delete_run_logs_and_verify(
+        "incident-run-123-456",
+        maximum_attempts=4,
+        stable_zero_observations=3,
+    )
+
+    assert delete_calls == ["incident-run-123-456"] * 4
+
+
+def test_elasticsearch_cleanup_fails_when_documents_never_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "incidentops.validation.checks.delete_run_logs",
+        lambda _run_id, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "incidentops.validation.checks.count_run_logs",
+        lambda _run_id, **_kwargs: 1,
+    )
+    monkeypatch.setattr("incidentops.validation.checks.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(ValidationCheckError, match="1 documents remain"):
+        delete_run_logs_and_verify(
+            "incident-run-123-456",
+            maximum_attempts=3,
+            stable_zero_observations=2,
+        )
 
 
 def test_slow_consumer_metrics_apply_all_acceptance_thresholds() -> None:

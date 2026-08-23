@@ -139,7 +139,15 @@ def build_tool_evidence(
                 else "The bounded processing latency summary is unavailable."
             ),
             raw_value_summary=(
-                {"percentile": 0.95, "duration_seconds": 0.975, "sample_count": 8}
+                {
+                    "percentile": 0.95,
+                    "duration_seconds": 0.975,
+                    "sample_count": 8,
+                    "database_duration_seconds": 0.01,
+                    "database_sample_count": 8,
+                    "processing_state": "elevated",
+                    "database_state": "normal",
+                }
                 if available
                 else {"error_type": "MetricQueryError"}
             ),
@@ -158,6 +166,13 @@ def build_tool_evidence(
                 "consumer_windowed_rate_per_second": 0.17,
                 "windowed_rate_difference_per_second": 1.91,
                 "consumer_is_slower": True,
+                "producer_baseline_rate_per_second": 2.08,
+                "producer_recent_rate_per_second": 2.08,
+                "producer_rate_change_ratio": 1.0,
+                "producer_surge": False,
+                "processing_error_rate_per_second": 0.0,
+                "processing_errors_present": False,
+                "valid_processing_present": True,
             },
             availability=EvidenceAvailability.AVAILABLE,
             **common,
@@ -167,7 +182,13 @@ def build_tool_evidence(
             evidence_id="log-slow-processing-summary",
             log_type=LogEvidenceType.SLOW_PROCESSING,
             observation="Elasticsearch found slow-processing events.",
-            raw_value_summary={"matching_log_count": 7, "timeline_entries_returned": 1},
+            raw_value_summary={
+                "matching_log_count": 7,
+                "timeline_entries_returned": 1,
+                "slow_processing_count": 7,
+                "database_operation_slow_count": 0,
+                "invalid_event_count": 0,
+            },
             availability=EvidenceAvailability.AVAILABLE,
             matching_log_count=7,
             timeline=[tool_input.start_time + timedelta(minutes=1)],

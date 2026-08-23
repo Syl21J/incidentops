@@ -46,16 +46,36 @@ def build_incident_knowledge_request(
             if trend in {"increasing", "stable", "decreasing"}:
                 terms.append(str(trend))
         elif item.metric_type == MetricEvidenceType.PROCESSING_LATENCY:
-            terms.extend(["order", "processing", "latency"])
+            if item.raw_value_summary.get("processing_state") == "elevated":
+                terms.extend(["order", "slow", "processing", "latency"])
+            else:
+                terms.extend(["normal", "order", "processing", "latency"])
+            if item.raw_value_summary.get("database_state") == "elevated":
+                terms.extend(["postgres", "database", "operation", "latency"])
+            else:
+                terms.extend(["normal", "database", "latency"])
         elif item.metric_type == MetricEvidenceType.PRODUCER_CONSUMER_RATES:
-            terms.extend(["producer", "consumer", "rate", "imbalance"])
+            terms.extend(["producer", "consumer", "rate"])
+            if item.raw_value_summary.get("producer_surge") is True:
+                terms.extend(["traffic", "spike", "surge", "backlog"])
+            elif item.raw_value_summary.get("processing_errors_present") is True:
+                terms.extend(["malformed", "invalid", "event", "validation"])
+            elif item.raw_value_summary.get("consumer_is_slower") is True:
+                terms.append("imbalance")
     for item in state.get("log_evidence", []):
-        mapping = {
-            LogEvidenceType.SLOW_PROCESSING: "slow processing",
-            LogEvidenceType.DATABASE_ERRORS: "database errors",
-            LogEvidenceType.KAFKA_ERRORS: "kafka broker errors",
-        }
-        terms.append(mapping[item.log_type])
+        if item.log_type == LogEvidenceType.SLOW_PROCESSING:
+            if item.raw_value_summary.get("slow_processing_count", 0):
+                terms.append("slow processing")
+            if item.raw_value_summary.get("database_operation_slow_count", 0):
+                terms.append("database operation slow")
+            if item.raw_value_summary.get("invalid_event_count", 0):
+                terms.append("invalid malformed event")
+        else:
+            mapping = {
+                LogEvidenceType.DATABASE_ERRORS: "database errors",
+                LogEvidenceType.KAFKA_ERRORS: "kafka broker errors",
+            }
+            terms.append(mapping[item.log_type])
     for item in state.get("negative_evidence", []):
         mapping = {
             NegativeEvidenceType.NO_DATABASE_ERRORS: "no database errors",

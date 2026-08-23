@@ -1,0 +1,30 @@
+schema_version: 2
+id: database_latency_v1
+title: Slow PostgreSQL operation
+description: >
+  A bounded delay is applied only inside each measured PostgreSQL order
+  transaction while the rest of the consumer remains unchanged.
+execution:
+  kind: database_latency
+  event_count: 80
+  producer_rate: 10
+  database_delay_ms: 800
+  minimum_lag: 30
+  slow_processing_threshold_ms: 500
+  database_slow_threshold_ms: 500
+  timeout_seconds: 120
+root_cause:
+  code: database_latency
+  service: order-consumer
+expected_metrics:
+  - {signal: consumer_lag, behavior: increasing}
+  - {signal: processing_latency, behavior: elevated}
+  - {signal: database_latency, behavior: elevated}
+  - {signal: producer_rate_change, behavior: stable}
+  - {signal: processing_errors, behavior: absent}
+expected_logs:
+  - {service: order-consumer, event_type: database_operation_slow}
+negative_evidence: [no_database_errors, no_kafka_broker_errors]
+expected_knowledge_documents: [incident_database_latency_backlog]
+acceptable_actions: [inspect_database_latency]
+forbidden_actions: [delete_database, reset_consumer_offsets, delete_kafka_topic]

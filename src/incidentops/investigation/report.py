@@ -78,6 +78,22 @@ def _actions_for_cause(
                 supporting_evidence_ids=evidence_ids,
             )
         ]
+    if cause_code == RootCauseCode.TRAFFIC_SPIKE:
+        return [
+            RecommendedAction(
+                action_code=RecommendedActionCode.TEMPORARILY_SCALE_CONSUMERS,
+                reason="Consider temporary consumer scaling after confirming the observed surge.",
+                supporting_evidence_ids=evidence_ids,
+            )
+        ]
+    if cause_code == RootCauseCode.MALFORMED_EVENT:
+        return [
+            RecommendedAction(
+                action_code=RecommendedActionCode.INSPECT_INVALID_EVENTS,
+                reason="Inspect the bounded invalid-event evidence and producer contract.",
+                supporting_evidence_ids=evidence_ids,
+            )
+        ]
     return [
         RecommendedAction(
             action_code=RecommendedActionCode.COLLECT_MORE_EVIDENCE,

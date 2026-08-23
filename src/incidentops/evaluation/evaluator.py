@@ -12,52 +12,79 @@ from incidentops.investigation.models import (
     NegativeEvidenceType,
 )
 from incidentops.scenarios import (
-    ExpectedComparison,
     ExpectedLog,
     ExpectedMetric,
     ScenarioManifest,
+    TelemetryBehavior,
+    TelemetrySignal,
 )
-
-SLOW_CONSUMER_MINIMUM_P95_SECONDS = 0.7
 
 
 def _metric_expectation_found(
-    expectation: ExpectedMetric | ExpectedComparison,
+    expectation: ExpectedMetric,
     evidence: list[MetricEvidence],
 ) -> bool:
-    if isinstance(expectation, ExpectedComparison):
-        return any(
-            item.metric_type == MetricEvidenceType.PRODUCER_CONSUMER_RATES
-            and item.raw_value_summary.get("consumer_is_slower") is True
-            for item in evidence
-        )
-    if expectation.metric == "incidentops_kafka_consumer_lag":
+    if expectation.signal == TelemetrySignal.CONSUMER_LAG:
         return any(
             item.metric_type == MetricEvidenceType.CONSUMER_LAG
-            and item.raw_value_summary.get("trend") == expectation.behavior
+            and item.raw_value_summary.get("trend") == expectation.behavior.value
             for item in evidence
         )
-    for item in evidence:
-        duration = item.raw_value_summary.get("duration_seconds")
-        if (
+    if expectation.signal in {
+        TelemetrySignal.PROCESSING_LATENCY,
+        TelemetrySignal.DATABASE_LATENCY,
+    }:
+        key = (
+            "processing_state"
+            if expectation.signal == TelemetrySignal.PROCESSING_LATENCY
+            else "database_state"
+        )
+        return any(
             item.metric_type == MetricEvidenceType.PROCESSING_LATENCY
-            and isinstance(duration, (int, float))
-            and not isinstance(duration, bool)
-            and duration >= SLOW_CONSUMER_MINIMUM_P95_SECONDS
-        ):
-            return True
-    return False
+            and item.raw_value_summary.get(key) == expectation.behavior.value
+            for item in evidence
+        )
+    if expectation.signal == TelemetrySignal.PRODUCER_RATE_CHANGE:
+        expected = expectation.behavior == TelemetryBehavior.SURGING
+        return any(
+            item.metric_type == MetricEvidenceType.PRODUCER_CONSUMER_RATES
+            and item.raw_value_summary.get("producer_surge") is expected
+            for item in evidence
+        )
+    if expectation.signal == TelemetrySignal.PROCESSING_ERRORS:
+        expected = expectation.behavior == TelemetryBehavior.PRESENT
+        return any(
+            item.metric_type == MetricEvidenceType.PRODUCER_CONSUMER_RATES
+            and item.raw_value_summary.get("processing_errors_present") is expected
+            for item in evidence
+        )
+    expected = expectation.behavior == TelemetryBehavior.PRESENT
+    return any(
+        item.metric_type == MetricEvidenceType.PRODUCER_CONSUMER_RATES
+        and item.raw_value_summary.get("valid_processing_present") is expected
+        for item in evidence
+    )
+
+
+_LOG_COUNT_FIELDS = {
+    "slow_processing": "slow_processing_count",
+    "database_operation_slow": "database_operation_slow_count",
+    "invalid_event_skipped": "invalid_event_count",
+}
 
 
 def _log_expectation_found(expectation: ExpectedLog, evidence: list[LogEvidence]) -> bool:
-    return (
-        expectation.service == "order-consumer"
-        and expectation.event_type == "slow_processing"
-        and any(
-            item.log_type == LogEvidenceType.SLOW_PROCESSING and item.matching_log_count > 0
-            for item in evidence
-        )
-    )
+    count_field = _LOG_COUNT_FIELDS[expectation.event_type]
+    for item in evidence:
+        count = item.raw_value_summary.get(count_field)
+        if (
+            item.log_type == LogEvidenceType.SLOW_PROCESSING
+            and isinstance(count, int | float)
+            and not isinstance(count, bool)
+            and count > 0
+        ):
+            return True
+    return False
 
 
 def _recall(found: int, expected: int) -> float:
@@ -109,9 +136,7 @@ def evaluate_incident_report(
     ]
     log_evidence = [item for item in report.supporting_evidence if isinstance(item, LogEvidence)]
     metric_expectations = [
-        item
-        for item in manifest.expected_metrics
-        if isinstance(item, (ExpectedMetric, ExpectedComparison))
+        item for item in manifest.expected_metrics if isinstance(item, ExpectedMetric)
     ]
     expected_metrics_found = sum(
         _metric_expectation_found(item, metric_evidence) for item in metric_expectations

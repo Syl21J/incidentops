@@ -10,6 +10,7 @@ from incidentops.consumer import (
     OffsetResetPolicy,
     calculate_partition_lag,
     collect_total_consumer_lag,
+    database_delay_ms,
     processing_delay_ms,
 )
 
@@ -93,3 +94,12 @@ def test_processing_delay_validation_is_bounded() -> None:
         processing_delay_ms("-1")
     with pytest.raises(argparse.ArgumentTypeError):
         processing_delay_ms("5001")
+
+
+def test_database_delay_validation_is_bounded() -> None:
+    assert database_delay_ms("0") == 0
+    assert database_delay_ms("5000") == 5000
+    with pytest.raises(argparse.ArgumentTypeError):
+        database_delay_ms("-1")
+    with pytest.raises(argparse.ArgumentTypeError):
+        database_delay_ms("5001")

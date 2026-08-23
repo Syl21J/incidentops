@@ -22,6 +22,7 @@ VALUES (%s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (event_id) DO NOTHING
 RETURNING event_id
 """
+DATABASE_DELAY_SQL = "SELECT pg_sleep(%s)"
 
 
 def connect_database(settings: Settings) -> Connection[tuple[Any, ...]]:
@@ -40,8 +41,13 @@ def connect_database(settings: Settings) -> Connection[tuple[Any, ...]]:
 def insert_order(
     connection: Connection[tuple[Any, ...]],
     event: OrderEvent,
+    *,
+    artificial_delay_ms: int = 0,
 ) -> bool:
-    """Insert an order once and return whether a new row was created."""
+    """Insert an order once with an optional bounded scenario-only database delay."""
+
+    if not 0 <= artificial_delay_ms <= 5_000:
+        raise ValueError("artificial database delay must be between 0 and 5000 ms")
 
     parameters = (
         event.event_id,
@@ -55,5 +61,7 @@ def insert_order(
 
     with connection.transaction():
         with connection.cursor() as cursor:
+            if artificial_delay_ms:
+                cursor.execute(DATABASE_DELAY_SQL, (artificial_delay_ms / 1000,))
             cursor.execute(INSERT_ORDER_SQL, parameters)
             return cursor.fetchone() is not None

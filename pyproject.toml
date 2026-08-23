@@ -25,6 +25,8 @@ incidentops-consumer = "incidentops.consumer:main"
 incidentops-log-search = "incidentops.log_search:main"
 incidentops-metric-query = "incidentops.metric_query:main"
 incidentops-knowledge = "incidentops.knowledge.cli:main"
+incidentops-scenario = "incidentops.scenario_runner.cli:main"
+incidentops-benchmark = "incidentops.benchmark.cli:main"
 
 [dependency-groups]
 dev = [
