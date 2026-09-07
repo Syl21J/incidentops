@@ -191,13 +191,13 @@ def test_hypothesis_references_are_unique_and_disjoint() -> None:
             contradicting_evidence_ids=["metric-consumer-lag-summary"],
             reasoning_summary="The reference is contradictory.",
         )
-    with pytest.raises(ValidationError, match="numerical claims"):
-        RootCauseHypothesis(
-            cause_code=RootCauseCode.SLOW_CONSUMER_PROCESSING,
-            confidence=0.8,
-            supporting_evidence_ids=["metric-consumer-lag-summary"],
-            reasoning_summary="P95 latency was elevated.",
-        )
+    with_metric_name = RootCauseHypothesis(
+        cause_code=RootCauseCode.SLOW_CONSUMER_PROCESSING,
+        confidence=0.8,
+        supporting_evidence_ids=["metric-consumer-lag-summary"],
+        reasoning_summary="P95 latency was elevated.",
+    )
+    assert with_metric_name.reasoning_summary == "P95 latency was elevated."
     with pytest.raises(ValidationError):
         RootCauseHypothesis(
             cause_code=RootCauseCode.SLOW_CONSUMER_PROCESSING,

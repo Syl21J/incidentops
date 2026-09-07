@@ -6,6 +6,7 @@ import hashlib
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from importlib import import_module
 from typing import Any
 
 EMBEDDING_DIMENSION = 384
@@ -84,11 +85,12 @@ class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
         if self._model is not None:
             return self._model
         try:
-            from sentence_transformers import SentenceTransformer
+            sentence_transformers = import_module("sentence_transformers")
+            sentence_transformer = sentence_transformers.SentenceTransformer
         except ImportError as error:
             raise EmbeddingError("sentence-transformers is not installed") from error
         try:
-            model = SentenceTransformer(self.model_name, device="cpu")
+            model = sentence_transformer(self.model_name, device="cpu")
         except Exception as error:
             raise EmbeddingError(f"could not load embedding model '{self.model_name}'") from error
         dimension = (

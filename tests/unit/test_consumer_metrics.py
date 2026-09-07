@@ -11,6 +11,7 @@ from incidentops.consumer import (
     calculate_partition_lag,
     collect_total_consumer_lag,
     database_delay_ms,
+    non_negative_float,
     processing_delay_ms,
 )
 
@@ -103,3 +104,13 @@ def test_database_delay_validation_is_bounded() -> None:
         database_delay_ms("-1")
     with pytest.raises(argparse.ArgumentTypeError):
         database_delay_ms("5001")
+
+
+def test_metrics_grace_validation_is_bounded() -> None:
+    assert non_negative_float("0") == 0
+    assert non_negative_float("8") == 8
+    assert non_negative_float("15") == 15
+    with pytest.raises(argparse.ArgumentTypeError):
+        non_negative_float("-1")
+    with pytest.raises(argparse.ArgumentTypeError):
+        non_negative_float("16")

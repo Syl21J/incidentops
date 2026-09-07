@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -17,6 +16,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from incidentops.knowledge.models import KnowledgeReference
 
@@ -372,15 +372,6 @@ class RootCauseHypothesis(StrictModel):
     )
     reasoning_summary: ShortText
 
-    @field_validator("reasoning_summary")
-    @classmethod
-    def reject_unverifiable_numeric_claims(cls, value: str) -> str:
-        """Keep numerical facts in deterministic evidence fields, not model prose."""
-
-        if re.search(r"\d", value):
-            raise ValueError("reasoning_summary must not contain numerical claims")
-        return value
-
     @model_validator(mode="after")
     def validate_distinct_references(self) -> RootCauseHypothesis:
         """Reject duplicate or simultaneously supporting and contradicting references."""
@@ -388,15 +379,30 @@ class RootCauseHypothesis(StrictModel):
         supporting = set(self.supporting_evidence_ids)
         contradicting = set(self.contradicting_evidence_ids)
         if self.cause_code != RootCauseCode.INSUFFICIENT_EVIDENCE and not supporting:
-            raise ValueError("a positive diagnosis must cite supporting evidence")
+            raise PydanticCustomError(
+                "missing_supporting_evidence",
+                "a positive diagnosis must cite supporting evidence",
+            )
         if len(supporting) != len(self.supporting_evidence_ids):
-            raise ValueError("supporting evidence identifiers must be unique")
+            raise PydanticCustomError(
+                "duplicate_supporting_evidence",
+                "supporting evidence identifiers must be unique",
+            )
         if len(contradicting) != len(self.contradicting_evidence_ids):
-            raise ValueError("contradicting evidence identifiers must be unique")
+            raise PydanticCustomError(
+                "duplicate_contradicting_evidence",
+                "contradicting evidence identifiers must be unique",
+            )
         if supporting & contradicting:
-            raise ValueError("evidence cannot both support and contradict one hypothesis")
+            raise PydanticCustomError(
+                "overlapping_evidence_reference",
+                "evidence cannot both support and contradict one hypothesis",
+            )
         if len(self.knowledge_reference_ids) != len(set(self.knowledge_reference_ids)):
-            raise ValueError("knowledge reference identifiers must be unique")
+            raise PydanticCustomError(
+                "duplicate_knowledge_reference",
+                "knowledge reference identifiers must be unique",
+            )
         return self
 
 
@@ -411,7 +417,10 @@ class HypothesisSet(StrictModel):
 
         causes = [item.cause_code for item in self.hypotheses]
         if len(set(causes)) != len(causes):
-            raise ValueError("hypothesis causes must be unique")
+            raise PydanticCustomError(
+                "duplicate_hypothesis_cause",
+                "hypothesis causes must be unique",
+            )
         return self
 
 
@@ -448,6 +457,7 @@ class IncidentReport(StrictModel):
     negative_evidence: list[NegativeEvidence] = Field(default_factory=list)
     knowledge_references: list[KnowledgeReference] = Field(default_factory=list, max_length=10)
     recommended_actions: list[RecommendedAction] = Field(default_factory=list, max_length=6)
+    verification_issues: list[ShortText] = Field(default_factory=list, max_length=20)
     limitations: list[ShortText] = Field(default_factory=list, max_length=20)
     tool_call_count: int = Field(ge=0, le=10)
     model_call_count: int = Field(default=0, ge=0, le=MAX_MODEL_CALLS)
@@ -494,6 +504,81 @@ class InvestigationTraceEvent(StrictModel):
         return _as_utc(value)
 
 
+ModelProviderKind = Literal["deterministic-test", "openai-compatible", "scripted-test"]
+ProposalKnowledgeMode = Literal["disabled", "required"]
+
+
+class EvidenceBundle(StrictModel):
+    """Replayable structured observations with no evaluator ground truth."""
+
+    schema_version: Literal[1] = 1
+    bundle_id: Identifier
+    source_investigation_id: Identifier
+    created_at: AwareDatetime
+    incident_request: IncidentRequest
+    completed_tasks: list[InvestigationTaskType] = Field(default_factory=list, max_length=6)
+    metric_evidence: list[MetricEvidence] = Field(default_factory=list, max_length=3)
+    log_evidence: list[LogEvidence] = Field(default_factory=list, max_length=3)
+    negative_evidence: list[NegativeEvidence] = Field(default_factory=list, max_length=2)
+    knowledge_references: list[KnowledgeReference] = Field(default_factory=list, max_length=10)
+    collection_tool_calls: int = Field(default=0, ge=0, le=MAX_TOOL_CALLS)
+    collection_attempts: int = Field(default=1, ge=1, le=MAX_INVESTIGATION_ATTEMPTS)
+
+    @model_validator(mode="after")
+    def validate_replay_boundary(self) -> EvidenceBundle:
+        """Keep replay evidence unique and inside the explicit incident window."""
+
+        if self.incident_request.start_time is None or self.incident_request.end_time is None:
+            raise ValueError("evidence bundle requires an explicit incident window")
+        evidence = [*self.metric_evidence, *self.log_evidence, *self.negative_evidence]
+        identifiers = [item.evidence_id for item in evidence]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("evidence bundle identifiers must be unique")
+        if len(self.completed_tasks) != len(set(self.completed_tasks)):
+            raise ValueError("evidence bundle completed tasks must be unique")
+        for item in evidence:
+            if (
+                item.start_time != self.incident_request.start_time
+                or item.end_time != self.incident_request.end_time
+            ):
+                raise ValueError("evidence bundle item does not match the incident window")
+        return self
+
+
+class ModelProposalArtifact(StrictModel):
+    """Bounded parsed model proposal captured before report sanitization."""
+
+    schema_version: Literal[1] = 1
+    proposal_id: Identifier
+    investigation_id: Identifier
+    evidence_bundle_id: Identifier
+    created_at: AwareDatetime
+    model_provider: ModelProviderKind
+    knowledge_mode: ProposalKnowledgeMode
+    model_invoked: bool
+    provider_available: bool | None
+    structured_response_valid: bool
+    hypotheses: list[RootCauseHypothesis] = Field(default_factory=list, max_length=MAX_HYPOTHESES)
+    model_errors: list[ShortText] = Field(default_factory=list, max_length=MAX_MODEL_CALLS)
+    model_call_count: int = Field(default=0, ge=0, le=MAX_MODEL_CALLS)
+
+    @model_validator(mode="after")
+    def validate_outcome_flags(self) -> ModelProposalArtifact:
+        """Require lifecycle flags to match the persisted parsed proposal."""
+
+        if self.model_invoked != (self.model_call_count > 0):
+            raise ValueError("model invocation must match the recorded model-call count")
+        if self.model_invoked and self.provider_available is None:
+            raise ValueError("a model invocation requires a provider availability result")
+        if not self.model_invoked and self.provider_available is not None:
+            raise ValueError("provider availability is not applicable without a model invocation")
+        if self.structured_response_valid != bool(self.hypotheses):
+            raise ValueError("structured response validity must match parsed hypotheses")
+        if self.structured_response_valid and self.provider_available is False:
+            raise ValueError("a valid structured response requires an available provider")
+        return self
+
+
 class EvaluationResult(StrictModel):
     """Structured comparison between a final report and scenario ground truth."""
 
@@ -516,6 +601,8 @@ class InvestigationArtifactPaths(StrictModel):
 
     report_path: Path
     trace_path: Path
+    evidence_path: Path | None = None
+    proposal_path: Path | None = None
 
 
 _EVIDENCE_IDS: dict[tuple[InvestigationTaskType, bool], str] = {

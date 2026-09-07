@@ -32,6 +32,7 @@ from incidentops.validation.checks import (
     validate_retrieval_benchmark,
     validate_scenario,
     validate_service_aggregation,
+    wait_for_run_logs_to_settle,
     write_scenario_metadata,
 )
 from incidentops.validation.models import SlowConsumerMetrics
@@ -60,6 +61,12 @@ def _artifact_directory(_arguments: argparse.Namespace) -> int:
 
 def _delete_run_logs(arguments: argparse.Namespace) -> int:
     delete_run_logs_and_verify(arguments.run_id)
+    return 0
+
+
+def _wait_for_run_logs(arguments: argparse.Namespace) -> int:
+    count = wait_for_run_logs_to_settle(arguments.run_id)
+    print(f"[OK]   Retained run log evidence settled at {count} documents")
     return 0
 
 
@@ -222,6 +229,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup = _command(subparsers, "delete-run-logs", _delete_run_logs)
     cleanup.add_argument("run_id")
+
+    settle = _command(subparsers, "wait-run-logs-stable", _wait_for_run_logs)
+    settle.add_argument("run_id")
 
     retrieval = _command(subparsers, "validate-retrieval-benchmark", _validate_retrieval)
     retrieval.add_argument("result", type=_path)

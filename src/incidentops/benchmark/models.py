@@ -7,9 +7,16 @@ from typing import Literal
 
 from pydantic import AwareDatetime, Field
 
-from incidentops.investigation.models import Identifier, RootCauseCode, StrictModel
+from incidentops.investigation.models import (
+    Identifier,
+    IncidentStatus,
+    RootCauseCode,
+    ShortText,
+    StrictModel,
+)
 
 KnowledgeMode = Literal["disabled", "required"]
+BenchmarkApproach = Literal["rules", "llm", "llm-rag"]
 
 
 class BenchmarkCaseResult(StrictModel):
@@ -17,8 +24,20 @@ class BenchmarkCaseResult(StrictModel):
 
     scenario_id: Identifier
     knowledge_mode: KnowledgeMode
+    approach: BenchmarkApproach | None = None
     expected_root_cause: RootCauseCode
     diagnosed_root_cause: RootCauseCode
+    proposed_root_cause: RootCauseCode | None = None
+    model_invoked: bool | None = None
+    provider_available: bool | None = None
+    structured_response_valid: bool | None = None
+    proposal_exact_match: bool | None = None
+    verifier_accepted: bool | None = None
+    citation_coverage: float | None = Field(default=None, ge=0, le=1)
+    proposal_unsupported_evidence_reference_count: int | None = Field(default=None, ge=0)
+    investigation_status: IncidentStatus | None = None
+    verification_issues: list[ShortText] = Field(default_factory=list, max_length=20)
+    model_errors: list[ShortText] = Field(default_factory=list, max_length=4)
     root_cause_exact_match: bool
     root_cause_rank: int | None = Field(default=None, ge=1, le=3)
     evidence_recall: float = Field(ge=0, le=1)
@@ -38,7 +57,14 @@ class BenchmarkAggregate(StrictModel):
     """Macro benchmark metrics and a true-by-predicted confusion matrix."""
 
     knowledge_mode: KnowledgeMode
+    approach: BenchmarkApproach | None = None
     scenario_count: int = Field(ge=1, le=20)
+    provider_availability_rate: float | None = Field(default=None, ge=0, le=1)
+    structured_response_valid_rate: float | None = Field(default=None, ge=0, le=1)
+    proposal_root_cause_accuracy: float | None = Field(default=None, ge=0, le=1)
+    verifier_acceptance_rate: float | None = Field(default=None, ge=0, le=1)
+    macro_citation_coverage: float | None = Field(default=None, ge=0, le=1)
+    proposal_unsupported_evidence_reference_count: int | None = Field(default=None, ge=0)
     root_cause_accuracy: float = Field(ge=0, le=1)
     mean_root_cause_rank: float = Field(ge=1, le=4)
     macro_evidence_recall: float = Field(ge=0, le=1)

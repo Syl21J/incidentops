@@ -146,6 +146,38 @@ services:
     networks:
       - incidentops
 
+  # Grafana reads existing Prometheus samples; dashboards and data sources are provisioned.
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION:-13.2.1}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-local-only}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SERVER_ROOT_URL: http://localhost:${GRAFANA_PORT:-3000}/
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/incidentops-pipeline.json
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning/datasources/prometheus.yml:/etc/grafana/provisioning/datasources/incidentops-prometheus.yml:ro
+      - ./grafana/provisioning/dashboards/incidentops.yml:/etc/grafana/provisioning/dashboards/incidentops.yml:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 18
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - incidentops
+
 networks:
   # One private bridge provides stable service names for container-to-container traffic.
   incidentops:
@@ -158,3 +190,4 @@ volumes:
   kafka_data:
   filebeat_data:
   prometheus_data:
+  grafana_data:

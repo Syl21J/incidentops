@@ -40,6 +40,15 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def non_negative_float(value: str) -> float:
+    """Parse a non-negative bounded metrics grace duration."""
+
+    parsed = float(value)
+    if not 0 <= parsed <= 15:
+        raise argparse.ArgumentTypeError("value must be between zero and 15")
+    return parsed
+
+
 def tcp_port(value: str) -> int:
     """Parse a valid TCP port."""
 
@@ -215,6 +224,12 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     )
     parser.add_argument("--metrics-host", default=settings.metrics_host)
     parser.add_argument("--metrics-port", type=tcp_port, default=settings.consumer_metrics_port)
+    parser.add_argument(
+        "--metrics-grace-seconds",
+        type=non_negative_float,
+        default=0.0,
+        help="Keep the metrics endpoint alive briefly for a final bounded scrape.",
+    )
     parser.add_argument(
         "--no-metrics",
         action="store_false",
@@ -504,6 +519,13 @@ def run(arguments: argparse.Namespace, settings: Settings) -> int:
     finally:
         consumer.close()
         connection.close()
+        grace_seconds = getattr(arguments, "metrics_grace_seconds", 0.0)
+        grace_deadline = time.monotonic() + grace_seconds
+        while metrics_server is not None and not shutdown_requested:
+            remaining = grace_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.25, remaining))
         if metrics_server is not None:
             metrics_server.close()
 

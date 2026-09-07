@@ -109,7 +109,7 @@ wait_for_healthy() {
   return 1
 }
 
-for service in postgres elasticsearch kafka filebeat prometheus; do
+for service in postgres elasticsearch kafka filebeat prometheus grafana; do
   wait_for_healthy "${service}"
 done
 
@@ -147,6 +147,18 @@ if ! curl --fail --silent --show-error "http://${prometheus_binding}/-/healthy" 
   exit 1
 fi
 success "Prometheus answers on http://${prometheus_binding}/-/healthy"
+
+# Grafana uses the internal Prometheus address and exposes only its UI on the host.
+grafana_binding="$(docker compose port grafana 3000 | tail -n 1)"
+if [[ -z "${grafana_binding}" ]]; then
+  error "Could not resolve the Grafana host port."
+  exit 1
+fi
+if ! curl --fail --silent --show-error "http://${grafana_binding}/api/health" >/dev/null; then
+  error "Grafana did not answer on http://${grafana_binding}/api/health."
+  exit 1
+fi
+success "Grafana answers on http://${grafana_binding}/"
 
 # A host TCP connection verifies the externally published Kafka listener.
 kafka_binding="$(docker compose port kafka 9092 | tail -n 1)"

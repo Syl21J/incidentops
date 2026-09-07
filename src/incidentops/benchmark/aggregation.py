@@ -17,6 +17,12 @@ def _mean(values: Sequence[float | int]) -> float:
     return sum(values) / len(values)
 
 
+def _observed_rate(numerator: int, denominator: int) -> float | None:
+    """Return no rate when the measured stage was never reached."""
+
+    return numerator / denominator if denominator else None
+
+
 def aggregate_cases(cases: list[BenchmarkCaseResult]) -> BenchmarkAggregate:
     """Aggregate one knowledge mode without weighting scenarios by expectation count."""
 
@@ -25,6 +31,9 @@ def aggregate_cases(cases: list[BenchmarkCaseResult]) -> BenchmarkAggregate:
     modes = {item.knowledge_mode for item in cases}
     if len(modes) != 1:
         raise ValueError("benchmark aggregation requires one knowledge mode")
+    approaches = {item.approach for item in cases}
+    if len(approaches) != 1:
+        raise ValueError("benchmark aggregation requires one diagnostic approach")
     confusion: dict[str, dict[str, int]] = {}
     for item in cases:
         expected = item.expected_root_cause.value
@@ -32,9 +41,42 @@ def aggregate_cases(cases: list[BenchmarkCaseResult]) -> BenchmarkAggregate:
         confusion.setdefault(expected, {})[diagnosed] = (
             confusion.setdefault(expected, {}).get(diagnosed, 0) + 1
         )
+    invoked = [item for item in cases if item.model_invoked is True]
+    available = [item for item in invoked if item.provider_available is True]
+    is_rules_reference = cases[0].approach == "rules"
+    structured = [
+        item
+        for item in (cases if is_rules_reference else available)
+        if item.structured_response_valid is True
+    ]
     return BenchmarkAggregate(
         knowledge_mode=cases[0].knowledge_mode,
+        approach=cases[0].approach,
         scenario_count=len(cases),
+        provider_availability_rate=(
+            None if is_rules_reference else _observed_rate(len(available), len(invoked))
+        ),
+        structured_response_valid_rate=(
+            None
+            if is_rules_reference
+            else _observed_rate(len(structured), len(available))
+        ),
+        proposal_root_cause_accuracy=_observed_rate(
+            sum(item.proposal_exact_match is True for item in structured),
+            len(structured),
+        ),
+        verifier_acceptance_rate=_observed_rate(
+            sum(item.verifier_accepted is True for item in structured),
+            len(structured),
+        ),
+        macro_citation_coverage=(
+            _mean([item.citation_coverage or 0.0 for item in structured])
+            if structured
+            else None
+        ),
+        proposal_unsupported_evidence_reference_count=sum(
+            item.proposal_unsupported_evidence_reference_count or 0 for item in cases
+        ),
         root_cause_accuracy=_mean([int(item.root_cause_exact_match) for item in cases]),
         mean_root_cause_rank=_mean(
             [item.root_cause_rank if item.root_cause_rank is not None else 4 for item in cases]

@@ -15,6 +15,10 @@ dependencies = [
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.11,<3",
     "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+rag = [
     "sentence-transformers>=5.1,<6",
     "torch>=2.7,<3",
 ]

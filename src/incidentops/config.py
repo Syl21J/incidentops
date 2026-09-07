@@ -37,6 +37,10 @@ class Settings(BaseSettings):
 
     elasticsearch_url: str = "http://localhost:9200"
     prometheus_url: str = "http://localhost:9090"
+    grafana_url: str = "http://localhost:3000"
+    grafana_admin_user: str = "admin"
+    grafana_admin_password: SecretStr = SecretStr("change-me-local-only")
+    grafana_timeout_seconds: float = Field(default=5.0, gt=0.0, le=30.0)
     order_random_seed: int = 42
 
     embedding_provider: Literal["sentence-transformers", "deterministic-test"] = (
@@ -71,7 +75,7 @@ class Settings(BaseSettings):
     llm_base_url: str | None = None
     llm_api_key: SecretStr | None = None
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    llm_timeout_seconds: float = Field(default=30.0, gt=0.0, le=120.0)
+    llm_timeout_seconds: float = Field(default=60.0, gt=0.0, le=120.0)
     llm_max_retries: int = Field(default=1, ge=0, le=2)
 
     investigation_max_time_range_hours: int = Field(default=6, ge=1, le=6)
@@ -98,6 +102,8 @@ class Settings(BaseSettings):
         "run_id",
         "elasticsearch_url",
         "prometheus_url",
+        "grafana_url",
+        "grafana_admin_user",
         "embedding_model",
         "metrics_host",
     )

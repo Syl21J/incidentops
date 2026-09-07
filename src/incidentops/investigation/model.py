@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from collections.abc import Sequence
+from enum import StrEnum
 from typing import Protocol, TypeVar, cast
 
 from langchain_core.messages import BaseMessage
@@ -15,8 +16,6 @@ from incidentops.config import Settings
 from incidentops.investigation.models import (
     MAX_MODEL_CALLS,
     HypothesisSet,
-    InvestigationPlan,
-    InvestigationTaskType,
 )
 
 StructuredOutput = TypeVar("StructuredOutput", bound=BaseModel)
@@ -26,12 +25,45 @@ class ModelConfigurationError(RuntimeError):
     """Report missing or unsafe live-model configuration without exposing secrets."""
 
 
+class ModelErrorCategory(StrEnum):
+    """Safe, stable categories for failures at the structured model boundary."""
+
+    QUOTA_EXCEEDED = "quota_exceeded"
+    TIMEOUT = "timeout"
+    REQUEST_REJECTED = "request_rejected"
+    INVALID_STRUCTURED_RESPONSE = "invalid_structured_response"
+    REQUEST_FAILED = "request_failed"
+    CALL_LIMIT = "call_limit"
+
+
 class StructuredModelError(RuntimeError):
-    """Report a failed or invalid structured model response."""
+    """Report a model failure without retaining provider payloads or credentials."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: ModelErrorCategory = ModelErrorCategory.INVALID_STRUCTURED_RESPONSE,
+        field: str | None = None,
+        rule: str | None = None,
+    ) -> None:
+        self.category = category
+        self.field = field
+        self.rule = rule
+        details = []
+        if field is not None:
+            details.append(f"field={field}")
+        if rule is not None:
+            details.append(f"rule={rule}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        super().__init__(f"{category.value}: {message}{suffix}")
 
 
 class ModelCallLimitError(StructuredModelError):
     """Report exhaustion of the global model-call budget."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, category=ModelErrorCategory.CALL_LIMIT)
 
 
 class StructuredModelProvider(Protocol):
@@ -62,7 +94,56 @@ def _validate_output[OutputModel: BaseModel](
     try:
         return schema.model_validate(value)
     except ValidationError as error:
-        raise StructuredModelError("model returned invalid structured output") from error
+        raise _validation_error(error) from error
+
+
+def _validation_error(error: ValidationError) -> StructuredModelError:
+    """Reduce Pydantic details to a safe field path and violated rule."""
+
+    details = error.errors(
+        include_url=False,
+        include_context=False,
+        include_input=False,
+    )
+    first = details[0] if details else {}
+    location = first.get("loc", ())
+    field = ".".join("*" if isinstance(part, int) else str(part) for part in location)
+    rule = first.get("type")
+    return StructuredModelError(
+        "model returned invalid structured output",
+        category=ModelErrorCategory.INVALID_STRUCTURED_RESPONSE,
+        field=field or None,
+        rule=rule if isinstance(rule, str) else None,
+    )
+
+
+def _live_model_error(error: Exception) -> StructuredModelError:
+    """Classify a provider exception using metadata only, never its response body."""
+
+    if isinstance(error, ValidationError):
+        return _validation_error(error)
+    status_code = getattr(error, "status_code", None)
+    class_names = {item.__name__.lower() for item in type(error).__mro__}
+    if status_code == 429 or "ratelimiterror" in class_names:
+        category = ModelErrorCategory.QUOTA_EXCEEDED
+        message = "live structured model quota was exceeded"
+    elif status_code == 408 or any("timeout" in name for name in class_names):
+        category = ModelErrorCategory.TIMEOUT
+        message = "live structured model request timed out"
+    elif isinstance(status_code, int) and 400 <= status_code < 500:
+        category = ModelErrorCategory.REQUEST_REJECTED
+        message = "live structured model request was rejected"
+    elif any(
+        marker in name
+        for name in class_names
+        for marker in ("outputparser", "jsondecode", "validation")
+    ):
+        category = ModelErrorCategory.INVALID_STRUCTURED_RESPONSE
+        message = "model returned invalid structured output"
+    else:
+        category = ModelErrorCategory.REQUEST_FAILED
+        message = "live structured model request failed"
+    return StructuredModelError(message, category=category)
 
 
 class _CallBudget:
@@ -123,7 +204,7 @@ class OpenAICompatibleModelProvider(_CallBudget):
             )
             raw_result = runnable.invoke(list(messages))
         except Exception as error:
-            raise StructuredModelError("live structured model request failed") from error
+            raise _live_model_error(error) from error
         return _validate_output(schema, raw_result)
 
 
@@ -244,7 +325,6 @@ def _deterministic_hypothesis(payload: dict[str, object]) -> dict[str, object]:
     negative_kafka = "negative-no-kafka-errors" in available
 
     cause = "insufficient_evidence"
-    supporting: list[str] = []
     if (
         processing_errors
         and valid_processing
@@ -257,13 +337,6 @@ def _deterministic_hypothesis(payload: dict[str, object]) -> dict[str, object]:
         and negative_kafka
     ):
         cause = "malformed_event"
-        supporting = [
-            "metric-processing-latency-p95",
-            "metric-producer-consumer-rate-comparison",
-            "log-slow-processing-summary",
-            "negative-no-database-errors",
-            "negative-no-kafka-errors",
-        ]
     elif (
         lag_increasing
         and processing_elevated
@@ -276,14 +349,6 @@ def _deterministic_hypothesis(payload: dict[str, object]) -> dict[str, object]:
         and negative_kafka
     ):
         cause = "database_latency"
-        supporting = [
-            "metric-consumer-lag-summary",
-            "metric-processing-latency-p95",
-            "metric-producer-consumer-rate-comparison",
-            "log-slow-processing-summary",
-            "negative-no-database-errors",
-            "negative-no-kafka-errors",
-        ]
     elif (
         lag_increasing
         and processing_normal
@@ -294,13 +359,6 @@ def _deterministic_hypothesis(payload: dict[str, object]) -> dict[str, object]:
         and negative_kafka
     ):
         cause = "traffic_spike"
-        supporting = [
-            "metric-consumer-lag-summary",
-            "metric-processing-latency-p95",
-            "metric-producer-consumer-rate-comparison",
-            "negative-no-database-errors",
-            "negative-no-kafka-errors",
-        ]
     elif (
         lag_increasing
         and processing_elevated
@@ -313,14 +371,6 @@ def _deterministic_hypothesis(payload: dict[str, object]) -> dict[str, object]:
         and negative_kafka
     ):
         cause = "slow_consumer_processing"
-        supporting = [
-            "metric-consumer-lag-summary",
-            "metric-processing-latency-p95",
-            "metric-producer-consumer-rate-comparison",
-            "log-slow-processing-summary",
-            "negative-no-database-errors",
-            "negative-no-kafka-errors",
-        ]
 
     if cause == "insufficient_evidence":
         return {
@@ -337,6 +387,7 @@ def _deterministic_hypothesis(payload: dict[str, object]) -> dict[str, object]:
                 }
             ]
         }
+    supporting = sorted(available)
     return {
         "hypotheses": [
             {
@@ -361,24 +412,13 @@ class EvidenceDrivenModelProvider(_CallBudget):
         schema: type[StructuredOutput],
         messages: Sequence[BaseMessage],
     ) -> StructuredOutput:
-        """Return a complete plan or evidence-derived hypotheses through Pydantic."""
+        """Return evidence-derived hypotheses through Pydantic."""
 
         self._reserve_call()
         payload = _message_payload(messages)
-        if schema is InvestigationPlan:
-            response: object = {
-                "tasks": [
-                    {
-                        "task_type": task_type.value,
-                        "reason": "Collect bounded read-only evidence.",
-                    }
-                    for task_type in InvestigationTaskType
-                ]
-            }
-        elif schema is HypothesisSet:
-            response = _deterministic_hypothesis(payload)
-        else:
+        if schema is not HypothesisSet:
             raise StructuredModelError("deterministic-test received an unsupported schema")
+        response: object = _deterministic_hypothesis(payload)
         return _validate_output(schema, response)
 
 
@@ -411,19 +451,6 @@ def slow_consumer_scripted_responses() -> list[object]:
     still decides whether the cited live evidence supports the proposed cause.
     """
 
-    plan = {
-        "tasks": [
-            {"task_type": task_name, "reason": "Collect bounded read-only evidence."}
-            for task_name in (
-                "check_consumer_lag",
-                "check_processing_latency",
-                "compare_producer_consumer_rates",
-                "find_slow_processing_logs",
-                "find_database_errors",
-                "find_kafka_errors",
-            )
-        ]
-    }
     hypothesis = {
         "hypotheses": [
             {
@@ -444,4 +471,4 @@ def slow_consumer_scripted_responses() -> list[object]:
             }
         ]
     }
-    return [plan, hypothesis, hypothesis, hypothesis]
+    return [hypothesis, hypothesis, hypothesis]

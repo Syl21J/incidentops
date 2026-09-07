@@ -9,7 +9,8 @@ from incidentops.benchmark.runner import (
     NEUTRAL_INCIDENT_DESCRIPTION,
     build_benchmark_incident_request,
 )
-from incidentops.scenario_runner.runtime import observations_match_manifest
+from incidentops.config import Settings
+from incidentops.scenario_runner.runtime import observations_match_manifest, run_scenario
 from incidentops.scenarios import load_scenario_manifest
 from incidentops.validation.models import ScenarioMetadata, SlowConsumerObservations
 
@@ -108,3 +109,22 @@ def test_graph_request_contains_only_neutral_operational_inputs() -> None:
     assert "database_latency_v1" not in serialized
     assert "database-latency" not in serialized
     assert "observations" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("start_delay", "minimum_incident"),
+    [(-1.0, 0.0), (121.0, 0.0), (0.0, -1.0), (0.0, 121.0)],
+)
+def test_scenario_phase_durations_are_bounded(
+    start_delay: float,
+    minimum_incident: float,
+) -> None:
+    manifest = load_scenario_manifest(PROJECT_DIR / "scenarios" / "slow_consumer.yaml")
+
+    with pytest.raises(ValueError, match="between zero and 120 seconds"):
+        run_scenario(
+            manifest,
+            Settings(),
+            start_delay_seconds=start_delay,
+            minimum_incident_seconds=minimum_incident,
+        )

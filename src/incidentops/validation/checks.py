@@ -159,6 +159,43 @@ def count_run_logs(run_id: str, *, elasticsearch_url: str | None = None) -> int:
         client.close()
 
 
+def wait_for_run_logs_to_settle(
+    run_id: str,
+    *,
+    elasticsearch_url: str | None = None,
+    maximum_attempts: int = 30,
+    stable_observations: int = 8,
+    poll_interval_seconds: float = 1.0,
+) -> int:
+    """Wait for a retained run's non-empty Filebeat delivery to stop changing."""
+
+    if not 1 <= maximum_attempts <= 60:
+        raise ValueError("settling attempts must be between one and 60")
+    if not 1 <= stable_observations <= maximum_attempts:
+        raise ValueError("stable observations must fit within settling attempts")
+    if not 0 <= poll_interval_seconds <= 5:
+        raise ValueError("settling polling interval must be between zero and five seconds")
+
+    previous: int | None = None
+    consecutive_equal = 0
+    current = 0
+    for attempt in range(maximum_attempts):
+        current = count_run_logs(run_id, elasticsearch_url=elasticsearch_url)
+        if current > 0:
+            consecutive_equal = consecutive_equal + 1 if current == previous else 1
+        else:
+            consecutive_equal = 0
+        if consecutive_equal >= stable_observations:
+            return current
+        previous = current
+        if attempt + 1 < maximum_attempts:
+            time.sleep(poll_interval_seconds)
+    raise ValidationCheckError(
+        "retained run-scoped Elasticsearch evidence did not settle; "
+        f"last observed document count was {current}"
+    )
+
+
 def delete_run_logs_and_verify(
     run_id: str,
     *,

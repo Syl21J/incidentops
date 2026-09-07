@@ -22,6 +22,9 @@ def test_default_application_endpoints_use_localhost(
     assert settings.postgres_host == "localhost"
     assert settings.postgres_port == 5432
     assert settings.prometheus_url == "http://localhost:9090"
+    assert settings.grafana_url == "http://localhost:3000"
+    assert settings.grafana_admin_user == "admin"
+    assert settings.grafana_timeout_seconds == 5
     assert settings.producer_metrics_port == 8001
     assert settings.consumer_metrics_port == 8002
     assert settings.consumer_processing_delay_ms == 0
@@ -37,6 +40,7 @@ def test_default_application_endpoints_use_localhost(
     assert settings.knowledge_top_k == 5
     assert settings.knowledge_candidate_k == 40
     assert settings.llm_temperature == 0
+    assert settings.llm_timeout_seconds == 60
     assert settings.investigation_max_tool_calls == 10
 
 

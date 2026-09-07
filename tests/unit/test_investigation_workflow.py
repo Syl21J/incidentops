@@ -26,7 +26,11 @@ from incidentops.investigation.models import (
 )
 from incidentops.investigation.nodes import InvestigationNodes
 from incidentops.investigation.policy import InvestigationPolicy
-from incidentops.investigation.report import assemble_incident_report, render_report_markdown
+from incidentops.investigation.report import (
+    assemble_incident_report,
+    render_report_markdown,
+    render_report_summary,
+)
 from incidentops.investigation.state import InvestigationState
 from incidentops.investigation.tools import (
     InvestigationToolInput,
@@ -44,17 +48,6 @@ from incidentops.knowledge.retrieval import KnowledgeRetrievalError
 
 START = datetime(2026, 8, 1, 13, 0, tzinfo=UTC)
 END = datetime(2026, 8, 1, 13, 10, tzinfo=UTC)
-
-
-def complete_plan_payload() -> dict[str, object]:
-    """Return a complete six-task structured planning response."""
-
-    return {
-        "tasks": [
-            {"task_type": task_type.value, "reason": "Collect bounded evidence."}
-            for task_type in InvestigationTaskType
-        ]
-    }
 
 
 def slow_consumer_hypothesis_payload() -> dict[str, object]:
@@ -414,8 +407,13 @@ def test_verifier_rejects_invented_reference_and_mismatched_log_count() -> None:
     invented_result = verify_investigation_state(invented)
     invented["verification_result"] = invented_result
     invented_report = assemble_incident_report(invented, completed_at=END)
+    invented_markdown = render_report_markdown(invented_report)
+    invented_summary = render_report_summary(invented_report)
     assert invented_result.decision == VerificationDecision.REJECTED
     assert invented_report.alternative_hypotheses == []
+    assert invented_report.verification_issues == invented_result.issues
+    assert invented_result.issues[0] in invented_markdown
+    assert invented_result.issues[0] in invented_summary
 
     mismatched = verifier_state()
     log_evidence = mismatched.get("log_evidence")
@@ -505,19 +503,11 @@ def test_report_is_deterministic_and_contains_only_allowlisted_actions() -> None
     }
     assert "delete_kafka_topic" not in markdown
     assert "metric-consumer-lag-summary" in markdown
+    assert "not the exact code path or operation responsible" in markdown
 
 
-def test_plan_node_allows_only_one_structured_repair_attempt() -> None:
-    incomplete_plan = {
-        "tasks": [
-            {"task_type": "check_consumer_lag", "reason": "Collect lag."},
-            {"task_type": "find_database_errors", "reason": "Check database errors."},
-        ]
-    }
-    nodes = build_nodes(
-        [incomplete_plan, complete_plan_payload()],
-        FakeToolset(),
-    )
+def test_plan_node_builds_the_complete_plan_without_a_model_call() -> None:
+    nodes = build_nodes([], FakeToolset())
     validated = nodes.validate_incident(
         {
             "incident_request": IncidentRequest(
@@ -542,7 +532,25 @@ def test_plan_node_allows_only_one_structured_repair_attempt() -> None:
     plan = result.get("plan")
     assert plan is not None
     assert len(plan.tasks) == 6
-    assert result.get("model_call_count") == 2
+    assert result.get("model_call_count") == 0
+
+
+def test_hypothesis_prompt_explains_evidence_and_bounded_summary_rules() -> None:
+    nodes = build_nodes([], FakeToolset())
+
+    messages = nodes._hypothesis_messages(verifier_state())
+
+    system_text = messages[0].content
+    assert isinstance(system_text, str)
+    assert "account for every available evidence_id exactly once" in system_text
+    assert "every completed zero-result error check" in system_text
+    assert "Do not duplicate an identifier or place it in both lists" in system_text
+    assert "Return each cause_code at most once" in system_text
+    assert (
+        "absence of database error logs does not establish normal database latency" in system_text
+    )
+    assert "Keep reasoning_summary short" in system_text
+    assert "do not copy raw payload values" in system_text
 
 
 def test_validation_derives_a_bounded_window_only_when_missing() -> None:
@@ -572,15 +580,9 @@ def test_validation_applies_a_stricter_configured_window_limit() -> None:
     assert result.get("terminal_status") == IncidentStatus.OUT_OF_SCOPE
 
 
-def test_graph_reports_pipeline_error_after_the_single_plan_repair_fails() -> None:
-    incomplete_plan = {
-        "tasks": [
-            {"task_type": "check_consumer_lag", "reason": "Collect lag."},
-            {"task_type": "find_database_errors", "reason": "Check database errors."},
-        ]
-    }
+def test_graph_does_not_consume_a_model_call_for_the_fixed_plan() -> None:
     fake_toolset = FakeToolset()
-    nodes = build_nodes([incomplete_plan, incomplete_plan], fake_toolset)
+    nodes = build_nodes([slow_consumer_hypothesis_payload()], fake_toolset)
     graph = build_investigation_graph(nodes)
 
     result = graph.invoke(
@@ -594,16 +596,44 @@ def test_graph_reports_pipeline_error_after_the_single_plan_repair_fails() -> No
     )
 
     report = result["final_report"]
+    assert report.status == IncidentStatus.DIAGNOSED
+    assert report.model_call_count == 1
+    assert report.tool_call_count == 6
+    assert {task for task, _attempt in fake_toolset.calls} == set(InvestigationTaskType)
+
+
+def test_graph_report_keeps_safe_hypothesis_validation_details() -> None:
+    invalid_hypothesis = slow_consumer_hypothesis_payload()
+    hypotheses = cast(list[dict[str, object]], invalid_hypothesis["hypotheses"])
+    hypotheses[0]["reasoning_summary"] = "Includes sk-sensitive-model-input."
+    hypotheses[0]["contradicting_evidence_ids"] = ["metric-consumer-lag-summary"]
+    nodes = build_nodes([invalid_hypothesis], FakeToolset())
+    graph = build_investigation_graph(nodes)
+
+    result = graph.invoke(
+        {
+            "incident_request": IncidentRequest(
+                description="Orders are delayed.",
+                start_time=START,
+                end_time=END,
+            )
+        }
+    )
+
+    report = result["final_report"]
+    errors = "\n".join(report.limitations)
     assert report.status == IncidentStatus.PIPELINE_ERROR
-    assert report.model_call_count == 2
-    assert report.tool_call_count == 0
-    assert fake_toolset.calls == []
+    assert (
+        "invalid_structured_response: model returned invalid structured output "
+        "(field=hypotheses.*, rule=overlapping_evidence_reference)"
+    ) in errors
+    assert "sk-sensitive-model-input" not in errors
 
 
 def test_complete_graph_runs_parallel_collection_and_diagnoses() -> None:
     fake_toolset = FakeToolset()
     nodes = build_nodes(
-        [complete_plan_payload(), slow_consumer_hypothesis_payload()],
+        [slow_consumer_hypothesis_payload()],
         fake_toolset,
     )
     graph = build_investigation_graph(nodes)
@@ -622,7 +652,7 @@ def test_complete_graph_runs_parallel_collection_and_diagnoses() -> None:
     report = result["final_report"]
     assert report.status == IncidentStatus.DIAGNOSED
     assert report.tool_call_count == 6
-    assert report.model_call_count == 2
+    assert report.model_call_count == 1
     assert report.investigation_attempts == 1
     assert {task for task, _attempt in fake_toolset.calls} == set(InvestigationTaskType)
 
@@ -631,7 +661,6 @@ def test_complete_graph_performs_one_targeted_recheck_and_replaces_evidence() ->
     fake_toolset = FakeToolset(latency_available_after=2)
     nodes = build_nodes(
         [
-            complete_plan_payload(),
             slow_consumer_hypothesis_payload(),
             slow_consumer_hypothesis_payload(),
         ],
@@ -658,7 +687,7 @@ def test_complete_graph_performs_one_targeted_recheck_and_replaces_evidence() ->
     assert report.status == IncidentStatus.DIAGNOSED
     assert report.investigation_attempts == 2
     assert report.tool_call_count == 7
-    assert report.model_call_count == 3
+    assert report.model_call_count == 2
     assert latency_calls == [1, 2]
 
 
@@ -666,7 +695,6 @@ def test_complete_graph_terminates_after_failed_single_recheck() -> None:
     fake_toolset = FakeToolset(latency_available_after=3)
     nodes = build_nodes(
         [
-            complete_plan_payload(),
             slow_consumer_hypothesis_payload(),
             slow_consumer_hypothesis_payload(),
         ],
@@ -688,13 +716,13 @@ def test_complete_graph_terminates_after_failed_single_recheck() -> None:
     assert report.status == IncidentStatus.INSUFFICIENT_EVIDENCE
     assert report.investigation_attempts == 2
     assert report.tool_call_count == 7
-    assert report.model_call_count == 3
+    assert report.model_call_count == 2
 
 
 def test_graph_respects_configuration_that_disables_rechecks() -> None:
     fake_toolset = FakeToolset(latency_available_after=2)
     nodes = build_nodes(
-        [complete_plan_payload(), slow_consumer_hypothesis_payload()],
+        [slow_consumer_hypothesis_payload()],
         fake_toolset,
         max_attempts=1,
     )
@@ -720,7 +748,6 @@ def test_graph_caps_a_wide_recheck_at_the_global_tool_limit() -> None:
     unavailable_toolset = UnavailableToolset()
     nodes = build_nodes(
         [
-            complete_plan_payload(),
             insufficient_hypothesis_payload(),
             insufficient_hypothesis_payload(),
         ],
@@ -753,7 +780,7 @@ def test_graph_adds_bounded_knowledge_without_changing_live_tool_logic() -> None
         "knowledge-000000000000000000000001"
     ]
     nodes = build_nodes(
-        [complete_plan_payload(), hypothesis],
+        [hypothesis],
         fake_toolset,
         knowledge_retriever=retriever,
         knowledge_enabled=True,
@@ -786,7 +813,7 @@ def test_graph_adds_bounded_knowledge_without_changing_live_tool_logic() -> None
 def test_optional_knowledge_failure_preserves_live_diagnosis() -> None:
     retriever = FakeKnowledgeRetriever(fail=True)
     nodes = build_nodes(
-        [complete_plan_payload(), slow_consumer_hypothesis_payload()],
+        [slow_consumer_hypothesis_payload()],
         FakeToolset(),
         knowledge_retriever=retriever,
         knowledge_enabled=True,
@@ -814,7 +841,7 @@ def test_report_drops_hallucinated_knowledge_citations() -> None:
         "knowledge-ffffffffffffffffffffffff"
     ]
     nodes = build_nodes(
-        [complete_plan_payload(), hypothesis],
+        [hypothesis],
         FakeToolset(),
         knowledge_retriever=FakeKnowledgeRetriever(),
         knowledge_enabled=True,
@@ -841,7 +868,7 @@ def test_report_drops_hallucinated_knowledge_citations() -> None:
 
 def test_required_knowledge_failure_stops_with_pipeline_error() -> None:
     nodes = build_nodes(
-        [complete_plan_payload()],
+        [],
         FakeToolset(),
         knowledge_retriever=FakeKnowledgeRetriever(fail=True),
         knowledge_enabled=True,
@@ -861,4 +888,4 @@ def test_required_knowledge_failure_stops_with_pipeline_error() -> None:
     report = result["final_report"]
     assert report.status == IncidentStatus.PIPELINE_ERROR
     assert report.tool_call_count == 6
-    assert report.model_call_count == 1
+    assert report.model_call_count == 0

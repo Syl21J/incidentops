@@ -310,6 +310,10 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
+]
+
+[package.optional-dependencies]
+rag = [
     { name = "sentence-transformers" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
@@ -334,9 +338,10 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pydantic-settings", specifier = ">=2.11,<3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
-    { name = "sentence-transformers", specifier = ">=5.1,<6" },
-    { name = "torch", specifier = ">=2.7,<3", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "sentence-transformers", marker = "extra == 'rag'", specifier = ">=5.1,<6" },
+    { name = "torch", marker = "extra == 'rag'", specifier = ">=2.7,<3", index = "https://download.pytorch.org/whl/cpu" },
 ]
+provides-extras = ["rag"]
 
 [package.metadata.requires-dev]
 dev = [

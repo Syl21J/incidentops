@@ -21,6 +21,7 @@ from incidentops.validation.checks import (
     validate_elasticsearch_mappings,
     validate_log_correlation,
     validate_service_aggregation,
+    wait_for_run_logs_to_settle,
     write_scenario_metadata,
 )
 from incidentops.validation.models import ScenarioMetadata, SlowConsumerMetrics
@@ -113,6 +114,47 @@ def test_elasticsearch_cleanup_fails_when_documents_never_settle(
             "incident-run-123-456",
             maximum_attempts=3,
             stable_zero_observations=2,
+        )
+
+
+def test_retained_log_wait_ignores_empty_and_changing_filebeat_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counts = iter([0, 4, 4, 8, 12, 12, 12, 12, 12, 12, 12, 12])
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "incidentops.validation.checks.count_run_logs",
+        lambda _run_id, **_kwargs: next(counts),
+    )
+    monkeypatch.setattr(
+        "incidentops.validation.checks.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    result = wait_for_run_logs_to_settle("incident-run-123-456")
+
+    assert result == 12
+    assert len(sleeps) == 11
+
+
+def test_retained_log_wait_fails_when_delivery_never_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = 0
+
+    def changing_count(_run_id: str, **_kwargs: object) -> int:
+        nonlocal current
+        current += 1
+        return current
+
+    monkeypatch.setattr("incidentops.validation.checks.count_run_logs", changing_count)
+    monkeypatch.setattr("incidentops.validation.checks.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(ValidationCheckError, match="did not settle"):
+        wait_for_run_logs_to_settle(
+            "incident-run-123-456",
+            maximum_attempts=4,
+            stable_observations=2,
         )
 
 

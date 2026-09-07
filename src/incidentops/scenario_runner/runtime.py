@@ -220,6 +220,8 @@ def _consumer_arguments(
         "1",
         "--metrics-port",
         str(settings.consumer_metrics_port),
+        "--metrics-grace-seconds",
+        "8",
     ]
     if isinstance(execution, MalformedEventsExecution):
         arguments.extend(
@@ -517,8 +519,15 @@ def run_scenario(
     *,
     retain_evidence: bool = False,
     output_metadata: Path | None = None,
+    start_delay_seconds: float = 0.0,
+    minimum_incident_seconds: float = 0.0,
 ) -> ScenarioMetadata:
     """Execute one bounded scenario and return only neutral run metadata and observations."""
+
+    if not 0 <= start_delay_seconds <= 120:
+        raise ValueError("start delay must be between zero and 120 seconds")
+    if not 0 <= minimum_incident_seconds <= 120:
+        raise ValueError("minimum incident duration must be between zero and 120 seconds")
 
     with _ScenarioResources(manifest, settings, retain_evidence=retain_evidence) as resources:
         started_at = datetime.now(UTC)
@@ -534,6 +543,9 @@ def run_scenario(
         )
         resources.group_created = True
         _wait_for_output(consumer, '"event_type":"partitions_assigned"', 30)
+        if start_delay_seconds:
+            time.sleep(start_delay_seconds)
+        incident_started_at = time.monotonic()
         producer = resources.start(
             "producer",
             _producer_arguments(manifest, settings, resources.run_id, resources.topic),
@@ -549,6 +561,7 @@ def run_scenario(
             deadline = time.monotonic() + manifest.execution.timeout_seconds
             last_error: Exception | None = None
             last_candidate: SlowConsumerObservations | None = None
+            matching_candidate: SlowConsumerObservations | None = None
             observations: SlowConsumerObservations | None = None
             while time.monotonic() < deadline:
                 try:
@@ -560,7 +573,12 @@ def run_scenario(
                     )
                     last_candidate = candidate
                     if observations_match_manifest(manifest, candidate):
-                        observations = candidate
+                        matching_candidate = candidate
+                    if (
+                        matching_candidate is not None
+                        and time.monotonic() - incident_started_at >= minimum_incident_seconds
+                    ):
+                        observations = matching_candidate
                         break
                 except Exception as error:
                     last_error = error

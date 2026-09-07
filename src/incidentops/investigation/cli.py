@@ -6,6 +6,7 @@ import argparse
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 from pydantic import ValidationError
 
@@ -24,10 +25,14 @@ from incidentops.investigation.models import (
     ServiceName,
 )
 from incidentops.investigation.report import (
+    build_evidence_bundle,
+    build_model_proposal_artifact,
     persist_investigation_artifacts,
     render_report_markdown,
+    render_report_summary,
     write_report_output,
 )
+from incidentops.investigation.state import InvestigationState
 from incidentops.investigation.tools import InvestigationToolset
 from incidentops.knowledge.embeddings import create_embedding_provider
 from incidentops.knowledge.retrieval import KnowledgeSearchService
@@ -69,6 +74,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Persist the validated JSON report and safe JSONL trace locally.",
     )
+    summarize = subparsers.add_parser(
+        "summarize",
+        help="Print a compact summary of one saved investigation report.",
+    )
+    summarize.add_argument("report", type=Path)
     return parser
 
 
@@ -135,7 +145,10 @@ def _run_investigation(args: argparse.Namespace) -> int:
             toolset,
             knowledge_retriever=knowledge_service,
         )
-        final_state = graph.invoke({"incident_request": request})
+        final_state = cast(
+            InvestigationState,
+            graph.invoke({"incident_request": request}),
+        )
     finally:
         if knowledge_service is not None:
             knowledge_service.close()
@@ -152,16 +165,33 @@ def _run_investigation(args: argparse.Namespace) -> int:
         print(rendered, end="")
 
     if args.persist_artifacts:
+        evidence_bundle = build_evidence_bundle(final_state)
+        model_proposal = build_model_proposal_artifact(
+            final_state,
+            evidence_bundle,
+            model_provider=settings.llm_provider,
+            knowledge_mode="required" if settings.knowledge_enabled else "disabled",
+        )
         paths = persist_investigation_artifacts(
             report,
             final_state.get("trace_events", []),
             settings.investigation_artifact_directory,
+            evidence_bundle=evidence_bundle,
+            model_proposal=model_proposal,
         )
         print(f"[INFO] JSON artifact: {paths.report_path}", file=sys.stderr)
         print(f"[INFO] JSONL trace: {paths.trace_path}", file=sys.stderr)
+        print(f"[INFO] Evidence bundle: {paths.evidence_path}", file=sys.stderr)
+        print(f"[INFO] Model proposal: {paths.proposal_path}", file=sys.stderr)
 
     print(f"[INFO] Investigation completed: {report.status.value}", file=sys.stderr)
     return 1 if report.status == IncidentStatus.PIPELINE_ERROR else 0
+
+
+def _summarize_report(path: Path) -> int:
+    report = IncidentReport.model_validate_json(path.read_text(encoding="utf-8"))
+    print(render_report_summary(report), end="")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -170,6 +200,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "summarize":
+            return _summarize_report(args.report)
         return _run_investigation(args)
     except (ModelConfigurationError, ValidationError, ValueError) as error:
         print(f"[ERROR] {error}", file=sys.stderr)
