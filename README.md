@@ -1,13 +1,8 @@
 # IncidentOps
 
-IncidentOps is a local, educational incident-investigation project built around an
-idempotent order-processing pipeline. It combines Kafka and PostgreSQL with structured logs,
+IncidentOps is an educational project built around an order-processing pipeline. It combines Kafka and PostgreSQL with structured logs,
 Prometheus metrics, Grafana dashboards, a bounded LangGraph workflow, and optional retrieval
 from a controlled operational knowledge base.
-
-The project is intentionally not production-ready. Production access control, TLS, high availability,
-external secret management, retention operations, and automatic remediation are outside its
-current scope.
 
 ## Architecture
 
@@ -42,8 +37,7 @@ controlled knowledge ----------------------+ optional bounded RAG
 ```
 
 The Python producer, consumer, and command-line tools run on the host. Docker Compose runs
-PostgreSQL, Kafka, Elasticsearch, Filebeat, Prometheus, and Grafana. Named volumes preserve service
-state across ordinary container restarts.
+PostgreSQL, Kafka, Elasticsearch, Filebeat, Prometheus, and Grafana. 
 
 ## How the services work
 
