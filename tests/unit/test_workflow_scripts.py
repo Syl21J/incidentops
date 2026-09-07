@@ -347,11 +347,7 @@ def test_investigation_modes_use_one_window_and_clean_only_the_owned_run(
     assert len(scenarios) == 1
     assert "--retain-evidence" in scenarios[0]["args"]
     investigation_cli_calls = calls(launcher_project, "incidentops.investigation.cli")
-    investigations = [
-        item
-        for item in investigation_cli_calls
-        if item["args"][0] == "investigate"
-    ]
+    investigations = [item for item in investigation_cli_calls if item["args"][0] == "investigate"]
     assert len(investigations) == (2 if mode == "rag" else 1)
     for index, item in enumerate(investigations):
         args = item["args"]

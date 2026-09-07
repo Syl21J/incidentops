@@ -379,8 +379,7 @@ def render_report_summary(report: IncidentReport) -> str:
         ("Diagnosis", root_cause),
         (
             "Evidence",
-            f"{len(report.supporting_evidence)} positive, "
-            f"{len(report.negative_evidence)} negative",
+            f"{len(report.supporting_evidence)} positive, {len(report.negative_evidence)} negative",
         ),
         ("Knowledge", str(len(report.knowledge_references))),
         ("Calls", f"{report.model_call_count} model, {report.tool_call_count} tool"),
@@ -394,14 +393,17 @@ def render_report_summary(report: IncidentReport) -> str:
     model_errors = [
         item
         for item in report.limitations
-        if any(item.startswith(f"{category}:") for category in (
-            "quota_exceeded",
-            "timeout",
-            "request_rejected",
-            "invalid_structured_response",
-            "request_failed",
-            "call_limit",
-        ))
+        if any(
+            item.startswith(f"{category}:")
+            for category in (
+                "quota_exceeded",
+                "timeout",
+                "request_rejected",
+                "invalid_structured_response",
+                "request_failed",
+                "call_limit",
+            )
+        )
     ]
     if model_errors:
         lines.extend(["Model errors:", *(f"- {error}" for error in model_errors)])
@@ -457,9 +459,7 @@ def build_evidence_bundle(
         "metric_evidence": [
             item.model_dump(mode="json") for item in state.get("metric_evidence", [])
         ],
-        "log_evidence": [
-            item.model_dump(mode="json") for item in state.get("log_evidence", [])
-        ],
+        "log_evidence": [item.model_dump(mode="json") for item in state.get("log_evidence", [])],
         "negative_evidence": [
             item.model_dump(mode="json") for item in state.get("negative_evidence", [])
         ],
@@ -506,9 +506,7 @@ def build_model_proposal_artifact(
     model_invoked = model_provider != "deterministic-test" and recorded_call_count > 0
     model_call_count = recorded_call_count if model_invoked else 0
     provider_available = (
-        not bool(error_categories & PROVIDER_UNAVAILABLE_CATEGORIES)
-        if model_invoked
-        else None
+        not bool(error_categories & PROVIDER_UNAVAILABLE_CATEGORIES) if model_invoked else None
     )
     hypotheses = state.get("hypotheses", [])
     return ModelProposalArtifact(

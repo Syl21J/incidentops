@@ -57,9 +57,7 @@ def aggregate_cases(cases: list[BenchmarkCaseResult]) -> BenchmarkAggregate:
             None if is_rules_reference else _observed_rate(len(available), len(invoked))
         ),
         structured_response_valid_rate=(
-            None
-            if is_rules_reference
-            else _observed_rate(len(structured), len(available))
+            None if is_rules_reference else _observed_rate(len(structured), len(available))
         ),
         proposal_root_cause_accuracy=_observed_rate(
             sum(item.proposal_exact_match is True for item in structured),
@@ -70,9 +68,7 @@ def aggregate_cases(cases: list[BenchmarkCaseResult]) -> BenchmarkAggregate:
             len(structured),
         ),
         macro_citation_coverage=(
-            _mean([item.citation_coverage or 0.0 for item in structured])
-            if structured
-            else None
+            _mean([item.citation_coverage or 0.0 for item in structured]) if structured else None
         ),
         proposal_unsupported_evidence_reference_count=sum(
             item.proposal_unsupported_evidence_reference_count or 0 for item in cases

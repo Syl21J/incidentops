@@ -253,9 +253,7 @@ def build_case_result(
         ),
         verifier_accepted=report.status.value == "diagnosed",
         citation_coverage=citation_coverage,
-        proposal_unsupported_evidence_reference_count=len(
-            proposal_references - all_evidence_ids
-        ),
+        proposal_unsupported_evidence_reference_count=len(proposal_references - all_evidence_ids),
         investigation_status=report.status,
         verification_issues=report.verification_issues,
         model_errors=[

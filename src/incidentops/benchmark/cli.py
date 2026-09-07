@@ -146,8 +146,7 @@ def render_replay_summary(result: EvidenceReplayResult) -> str:
         "Evidence replay",
         f"Approach | {result.approach}",
         f"Bundle | {result.evidence_bundle_id}",
-        "Provider available | "
-        + _flag(result.proposal.provider_available, true="yes", false="no"),
+        "Provider available | " + _flag(result.proposal.provider_available, true="yes", false="no"),
         "Structured response | "
         + ("valid" if result.proposal.structured_response_valid else "invalid"),
         f"Proposed cause | {proposed}",
@@ -182,27 +181,30 @@ def render_evidence_comparison_summary(result: EvidenceComparisonResult) -> str:
         )
         for case in result.cases
     ]
-    return "\n".join(
-        [
-            "Evidence comparison",
-            f"Bundle: {result.evidence_bundle_id}",
-            f"Scenario: {result.scenario_id}",
-            "",
-            *_table(
-                (
-                    "Approach",
-                    "Provider",
-                    "Schema",
-                    "Proposed",
-                    "Citations",
-                    "Verifier",
-                    "Accepted correct",
-                    "Calls",
+    return (
+        "\n".join(
+            [
+                "Evidence comparison",
+                f"Bundle: {result.evidence_bundle_id}",
+                f"Scenario: {result.scenario_id}",
+                "",
+                *_table(
+                    (
+                        "Approach",
+                        "Provider",
+                        "Schema",
+                        "Proposed",
+                        "Citations",
+                        "Verifier",
+                        "Accepted correct",
+                        "Calls",
+                    ),
+                    rows,
                 ),
-                rows,
-            ),
-        ]
-    ) + "\n"
+            ]
+        )
+        + "\n"
+    )
 
 
 def _validate_result(result: MultiIncidentBenchmarkResult) -> None:

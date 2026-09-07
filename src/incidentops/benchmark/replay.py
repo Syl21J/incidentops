@@ -146,9 +146,7 @@ def replay_bundle(
     except StructuredModelError as error:
         state["terminal_status"] = IncidentStatus.PIPELINE_ERROR
         state["errors"] = [str(error)]
-    state["model_call_count"] = (
-        0 if approach == "rules" else provider.call_count - calls_before
-    )
+    state["model_call_count"] = 0 if approach == "rules" else provider.call_count - calls_before
     completed_at = datetime.now(UTC)
     report = _verify_and_report(state, completed_at=completed_at)
     proposal = build_model_proposal_artifact(

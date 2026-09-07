@@ -247,9 +247,7 @@ def test_rules_replay_abstains_when_the_bundle_has_no_incident_signature() -> No
     metrics[0]["raw_value_summary"].update(
         {"start_value": 5.0, "end_value": 5.0, "trend": "stable"}
     )
-    metrics[1]["raw_value_summary"].update(
-        {"duration_seconds": 0.02, "processing_state": "normal"}
-    )
+    metrics[1]["raw_value_summary"].update({"duration_seconds": 0.02, "processing_state": "normal"})
     metrics[2]["raw_value_summary"].update(
         {
             "producer_windowed_rate_per_second": 5.0,
@@ -260,9 +258,7 @@ def test_rules_replay_abstains_when_the_bundle_has_no_incident_signature() -> No
     )
     logs = cast(list[dict[str, Any]], payload["log_evidence"])
     logs[0]["matching_log_count"] = 0
-    logs[0]["raw_value_summary"].update(
-        {"matching_log_count": 0, "slow_processing_count": 0}
-    )
+    logs[0]["raw_value_summary"].update({"matching_log_count": 0, "slow_processing_count": 0})
     bundle = EvidenceBundle.model_validate(payload)
 
     result = replay_bundle(bundle, Settings(), approach="rules")
@@ -299,9 +295,7 @@ def test_rescore_rejects_a_saved_slow_consumer_proposal_against_db_latency() -> 
         {"database_duration_seconds": 1.0, "database_state": "elevated"}
     )
     contradictory = EvidenceBundle.model_validate(payload)
-    proposal = initial.proposal.model_copy(
-        update={"evidence_bundle_id": contradictory.bundle_id}
-    )
+    proposal = initial.proposal.model_copy(update={"evidence_bundle_id": contradictory.bundle_id})
 
     result = rescore_proposal(contradictory, proposal)
 

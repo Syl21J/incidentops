@@ -74,8 +74,7 @@ def add_scenario_annotation(
         "text": f"Scenario {metadata.scenario_id} ({metadata.run_id})",
     }
     credentials = (
-        f"{settings.grafana_admin_user}:"
-        f"{settings.grafana_admin_password.get_secret_value()}"
+        f"{settings.grafana_admin_user}:{settings.grafana_admin_password.get_secret_value()}"
     ).encode()
     authorization = base64.b64encode(credentials).decode("ascii")
     request = Request(  # noqa: S310 - the origin is validated above
